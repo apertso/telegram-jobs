@@ -1,0 +1,8 @@
+.env
+*.log
+__pycache__
+node_modules
+_venv_
+.opencode
+latest
+telegram.csv

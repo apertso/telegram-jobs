@@ -1,0 +1,7 @@
+# Зависимости Telegram Jobs Collector
+browser-use>=0.13.3
+browser-harness>=0.1.4
+python-dotenv>=1.0
+flask>=3.0
+requests>=2.31
+openai>=1.0
