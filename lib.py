@@ -150,11 +150,14 @@ def message_permalink(source_url: str, message_id: str):
 def normalize_url(url: str) -> str:
     """Нормализует URL:
     - приводит scheme/host к нижнему регистру;
-    - удаляет tracking-параметры (utm_*, fbclid, gclid, yclid);
-    - удаляет завершающий слеш в пути (кроме корня);
-    - сохраняет параметр thread в ссылках Telegram Web (он в фрагменте).
+    - удаляет только tracking-параметры (utm_*, fbclid, gclid, yclid);
+    - НЕ выполняет повторное percent-encoding query-параметров (сохраняет
+      исходные значения как есть);
+    - НЕ изменяет значимый путь: `/k/` остаётся `/k/` (не превращается в `/k`);
+    - сохраняет fragment целиком, включая параметр `thread`;
+    - сохраняет остальные query-параметры и их значения.
 
-    Неизвестные query-параметры сохраняются.
+    Возвращает исходную строку, если URL не http(s) или неразборный.
     """
     if not url:
         return ""
@@ -171,25 +174,30 @@ def normalize_url(url: str) -> str:
     # Фильтруем query-параметры (thread здесь не бывает — он в фрагменте).
     kept = []
     for key, val in _iter_query(parts.query):
-        if key.lower() in TRACKING_PARAMS:
+        kl = key.lower()
+        if kl in TRACKING_PARAMS:
             continue
-        if key.lower().startswith("utm_"):
+        if kl.startswith("utm_"):
             continue
         kept.append((key, val))
 
-    from urllib.parse import urlencode, urlunsplit as _urlunsplit
+    # Собираем query без повторного percent-encoding (join «key=val» как есть).
+    new_query = "&".join(
+        (k if v == "" else f"{k}={v}") for k, v in kept
+    )
 
-    new_query = urlencode(kept)
+    # Сохраняем исходный путь без изменения значимых сегментов. Удаляем только
+    # завершающий слеш на корне «/», но не трогаем сегменты вроде «/k/».
     path = parts.path
-    # Удаляем завершающий слеш, но не трогаем корень "/".
-    if path.endswith("/") and len(path) > 1:
-        path = path.rstrip("/")
-        if not path:
+    if path != "/" and path.endswith("/"):
+        path = path[:-1]
+        if path == "":
             path = "/"
 
-    return _urlunsplit(
-        (parts.scheme.lower(), parts.netloc.lower(), path, new_query, parts.fragment)
-    )
+    scheme = parts.scheme.lower()
+    netloc = parts.netloc.lower()
+    fragment = parts.fragment
+    return f"{scheme}://{netloc}{path}" + (f"?{new_query}" if new_query else "") + (f"#{fragment}" if fragment else "")
 
 
 def _iter_query(query: str):
@@ -286,16 +294,77 @@ def choose_url(source_url: str, message: dict | None, job_url: str) -> str:
 # --------------------------------------------------------------------------- #
 # Работа с CSV
 # --------------------------------------------------------------------------- #
+import os
+import tempfile
+
+try:
+    import fcntl  # available on POSIX; Windows path handled separately below
+except ImportError:
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
+
+
+class _FileLock:
+    """Простая блокировка файла, совместимая с Windows и POSIX.
+
+    Защищает read-deduplicate-write блок от одновременных запросов.
+    При отсутствии поддержки блокировки — не мешает работе (best effort).
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self._fh = None
+
+    def __enter__(self):
+        lock_path = self.path + ".lock"
+        self._fh = open(lock_path, "a+")
+        if msvcrt:
+            msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            try:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+            except Exception:
+                pass
+        return self
+
+    def __exit__(self, *exc):
+        if self._fh is None:
+            return
+        try:
+            if msvcrt:
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+
 def read_rows(path: str) -> list[dict]:
-    """Читает все строки данных (без заголовка) как словари по CSV_HEADER."""
-    rows: list[dict] = []
-    try:
-        with open(path, "r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                rows.append({k: (row.get(k) or "") for k in CSV_HEADER})
-    except FileNotFoundError:
+    """Читает все строки данных (без заголовка) как словари по CSV_HEADER.
+
+    При отсутствии файла возвращает []. При повреждённом/несовместимом
+    заголовке выбрасывает ValueError — продолжать нельзя.
+    """
+    if not os.path.exists(path):
         return []
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames != CSV_HEADER:
+            raise ValueError(
+                f"Несовместимый заголовок CSV: {reader.fieldnames!r}, "
+                f"ожидается {CSV_HEADER!r}"
+            )
+        rows = []
+        for row in reader:
+            rows.append({k: (row.get(k) or "") for k in CSV_HEADER})
     return rows
 
 
@@ -308,44 +377,80 @@ def _existing_keys(rows: list[dict]) -> set[str]:
     return keys
 
 
+def reset_csv(path: str) -> None:
+    """Создаёт пустой CSV (только заголовок), перезаписывая существующий файл.
+
+    Вызывается в начале каждого прогона collect.py, чтобы telegram.csv
+    содержал только вакансии текущего сбора, а не накапливал данные
+    от предыдущих запусков. Внутрипрогонная дедупликация сохраняется
+    (одна вакансия из разных источников не дублируется).
+    """
+    _write_rows(path, [])
+
+
 def add_jobs(path: str, jobs: list[dict]):
     """Добавляет новые вакансии в CSV с дедупликацией.
 
     Возвращает (rows_added, duplicates). Существующие строки и заголовок
-    сохраняются. Файл создаётся при первом запуске.
+    сохраняются. Файл создаётся при первом запуске. Запись атомарна:
+    пишется временный файл в той же директории и заменяется через os.replace.
+    Блокировка защищает от одновременных запросов.
     """
-    rows = read_rows(path)
-    existing = _existing_keys(rows)
-    new_keys = set()
+    # Отбрасываем полностью пустые вакансии до блокировки.
+    jobs = [j for j in (jobs or []) if not _is_empty_job(normalize_job(j))]
 
-    rows_added = 0
-    duplicates = 0
+    with _FileLock(path):
+        rows = read_rows(path)
+        existing = _existing_keys(rows)
+        new_keys = set()
 
-    for job in jobs:
-        norm = normalize_job(job)
-        key = dedup_key(
-            norm["Title"], norm["Company"], norm["Location"], norm["WorkMode"], norm["URL"]
-        )
-        if not key or key in existing or key in new_keys:
-            duplicates += 1
-            continue
-        new_keys.add(key)
-        rows.append(norm)
-        rows_added += 1
+        rows_added = 0
+        duplicates = 0
 
-    _write_rows(path, rows)
+        for job in jobs:
+            norm = normalize_job(job)
+            if _is_empty_job(norm):
+                continue
+            key = dedup_key(
+                norm["Title"], norm["Company"], norm["Location"], norm["WorkMode"], norm["URL"]
+            )
+            if not key or key in existing or key in new_keys:
+                duplicates += 1
+                continue
+            new_keys.add(key)
+            rows.append(norm)
+            rows_added += 1
+
+        _write_rows(path, rows)
     return rows_added, duplicates
 
 
-def _write_rows(path: str, rows: list[dict]) -> None:
-    import os
+def _is_empty_job(job: dict) -> bool:
+    """True, если вакансия полностью пустая (нет ни одного непустого поля)."""
+    return not any(
+        (job.get(k) or "").strip()
+        for k in ("Title", "Company", "Location", "WorkMode", "URL")
+    )
 
-    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_HEADER, quoting=csv.QUOTE_MINIMAL)
-        writer.writeheader()
-        for r in rows:
-            writer.writerow({k: r.get(k, "") for k in CSV_HEADER})
+
+def _write_rows(path: str, rows: list[dict]) -> None:
+    """Атомарная запись CSV во временный файл в той же директории + os.replace."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=directory, suffix=".tmp", prefix=".telegram_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_HEADER, quoting=csv.QUOTE_MINIMAL)
+            writer.writeheader()
+            for r in rows:
+                writer.writerow({k: r.get(k, "") for k in CSV_HEADER})
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except Exception:
+            pass
+        raise
 
 
 def stats_totals(path: str) -> int:

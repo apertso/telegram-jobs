@@ -1,8 +1,10 @@
 .env
+.env.example
 *.log
 __pycache__
 node_modules
-_venv_
 .opencode
 latest
 telegram.csv
+project_code.txt
+.playwright-mcp/

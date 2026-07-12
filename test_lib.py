@@ -94,7 +94,51 @@ print(content)
 check("csv header", content.splitlines()[0], "Title,Company,Location,WorkMode,URL")
 check("csv rows count", len(content.strip().splitlines()), 4)  # header + 3 unique
 
+# --- reset_csv ------------------------------------------------------------ #
+# reset_csv должен перезаписывать файл: только заголовок, без строк данных.
+csv_reset = os.path.join(tmp, "reset_test.csv")
+lib.add_jobs(csv_reset, jobs)  # пишем 2 уникальные вакансии
+check("reset: rows before reset", len(lib.read_rows(csv_reset)), 2)
+lib.reset_csv(csv_reset)
+rows_after = lib.read_rows(csv_reset)
+check("reset: rows after reset", len(rows_after), 0)
+with open(csv_reset, encoding="utf-8") as f:
+    header = f.readline().strip()
+check("reset: header preserved", header, "Title,Company,Location,WorkMode,URL")
+# После reset можно снова добавлять вакансии (дедупликация с пустым файлом).
+added3, dups3 = lib.add_jobs(csv_reset, jobs)
+check("reset: add after reset works", added3, 2)
+
 print("\n[lib] все проверки пройдены")
+
+
+# --- _parse_tabs (browser_agent) ----------------------------------------- #
+import browser_agent as ba
+
+# JSON-формат
+json_result = '{"tabs": [{"tabId": "1", "url": "chrome-extension://abc/connect.html", "title": "Connect"}, {"tabId": "2", "url": "https://web.telegram.org/k/", "title": "Telegram"}]}'
+# browser_tabs может вернуть просто массив
+json_arr = '[{"tabId": "1", "url": "chrome-extension://abc/connect.html"}, {"tabId": "2", "url": "https://example.com"}]'
+tabs1 = ba._parse_tabs(json_arr)
+check("parse_tabs json count", len(tabs1), 2)
+check("parse_tabs json tabId", tabs1[0]["tabId"], "1")
+check("parse_tabs json url", "connect.html" in tabs1[0]["url"], True)
+check("parse_tabs json tab2", tabs1[1]["tabId"], "2")
+
+# MCP-формат с ### Result (текстовый: "- 0: (current) [Title](url)")
+mcp_text = '### Result\n- 0: (current) [Welcome](chrome-extension://abc/connect.html?token=xyz)\n- 1: [Telegram](https://web.telegram.org/k/)\n### Ran Playwright code\n...'
+tabs2 = ba._parse_tabs(mcp_text)
+check("parse_tabs mcp count", len(tabs2), 2)
+check("parse_tabs mcp tabId", tabs2[0]["tabId"], "0")
+check("parse_tabs mcp connect url", "connect.html" in tabs2[0]["url"], True)
+check("parse_tabs mcp tab2 id", tabs2[1]["tabId"], "1")
+check("parse_tabs mcp tab2 url", "web.telegram.org" in tabs2[1]["url"], True)
+
+# Пустой результат
+check("parse_tabs empty", ba._parse_tabs(""), [])
+check("parse_tabs none", ba._parse_tabs("no tabs here"), [])
+
+print("\n[browser_agent._parse_tabs] все проверки пройдены")
 
 
 # --- server.process_messages с моком OpenRouter -------------------------- #

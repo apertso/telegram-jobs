@@ -1,0 +1,10 @@
+{
+  "browser": {
+    "extension": true,
+    "launch": false
+  },
+  "server": {
+    "transport": "stdio"
+  },
+  "caps": []
+}
