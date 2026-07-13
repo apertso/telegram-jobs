@@ -536,14 +536,9 @@ async def collect_with_scroll(
     нового JS с актуальными селекторами. Этот JS используется во всех
     последующих извлечениях.
 
-    При since_hours <= 0 — одно извлечение без прокрутки (обратная совм.).
     Возвращает список сообщений; фильтр по времени применяет server.py.
     """
     js = extract_js or EXTRACT_MESSAGES_JS
-
-    if since_hours <= 0:
-        raw = await mcp.call("browser_evaluate", {"function": js}, timeout=10)
-        return _parse_evaluate_result(raw, source_url)
 
     cutoff = time.time() - since_hours * 3600
     now = time.time()

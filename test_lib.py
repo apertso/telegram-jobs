@@ -165,20 +165,18 @@ server_mod._call_openrouter = fake_call
 
 csv2 = os.path.join(tmp, "telegram2.csv")
 orig = server_mod.CSV_PATH
-orig_since2 = server_mod.SINCE_HOURS
 server_mod.CSV_PATH = csv2
-server_mod.SINCE_HOURS = 0  # отключаем фильтр по времени — тест проверяет извлечение/дедуп
 try:
+    fresh_at = (_dt.now(_tz.utc) - _td(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     stats = server_mod.process_messages(
         "https://web.telegram.org/k/#@evacuatejobs",
         [
-            {"messageId": "9", "text": "We are hiring...", "publishedAt": "2026-07-11T10:00:00Z",
+            {"messageId": "9", "text": "We are hiring...", "publishedAt": fresh_at,
              "url": "https://t.me/evacuatejobs/9", "links": ["https://www.linkedin.com/jobs/view/4410073565/"]},
         ],
     )
 finally:
     server_mod.CSV_PATH = orig
-    server_mod.SINCE_HOURS = orig_since2
 
 check("process messagesReceived", stats["messagesReceived"], 1)
 check("process jobsExtracted", stats["jobsExtracted"], 2)
@@ -255,11 +253,6 @@ check("filter keeps fresh", len(kept), 2)             # fresh + no_ts
 check("filter drops stale", dropped, 1)
 check("filter keeps no-ts in kept", any(m.text == "no-ts" for m in kept), True)
 check("filter drops stale not in kept", any(m.text == "stale" for m in kept), False)
-
-# since_hours=0 → без фильтрации
-kept0, dropped0 = server_mod.filter_by_since([fresh, stale, no_ts], 0)
-check("filter disabled keeps all", len(kept0), 3)
-check("filter disabled drops none", dropped0, 0)
 
 # все старые — все отброшены
 kept_all_old, dropped_all_old = server_mod.filter_by_since([stale, stale], 24)
@@ -391,13 +384,7 @@ class _FakeMCP:
         return r
 
 
-# Сценарий 1: since_hours=0 — без прокрутки, одно извлечение.
-fake0 = _FakeMCP([_msg_json([{"messageId": "x", "text": "hi", "publishedAt": "", "url": "", "links": []}])])
-res0 = _asyncio.run(ba.collect_with_scroll(fake0, "https://web.telegram.org/k/#@t", 0))
-check("scroll disabled returns single extract", len(res0), 1)
-check("scroll disabled no scrolls", fake0.scroll_count, 0)
-
-# Сценарий 2: приземлились на старых сообщениях, скроллим к новым, потом к старым.
+# Сценарий 1: приземлились на старых сообщениях, скроллим к новым, потом к старым.
 #   extract 0 (initial): 2 old messages
 #   phase 1 scroll newer -> extract 1: 2 fresh messages
 #   phase 1 scroll newer -> extract 2: same fresh (no new -> stop)

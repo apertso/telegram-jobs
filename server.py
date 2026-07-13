@@ -313,10 +313,7 @@ def filter_by_since(messages: list[MessageIn], since_hours: int) -> tuple[list[M
     Сообщения без распознаваемой метки publishedAt сохраняются (консервативно:
     мы не можем определить их возраст и предпочитаем не терять данные).
     Возвращает (оставленные, количество_отброшенных).
-    Если since_hours <= 0 — фильтрация отключена, возвращается (messages, 0).
     """
-    if since_hours <= 0:
-        return messages, 0
     cutoff = time.time() - since_hours * 3600
     kept: list[MessageIn] = []
     dropped = 0
@@ -475,10 +472,7 @@ def import_telegram():
 def main():
     print(f"[server] Запуск обработчика на порту {PORT}")
     print(f"[server] CSV: {CSV_PATH}")
-    if SINCE_HOURS > 0:
-        print(f"[server] Фильтр по времени: только сообщения за последние {SINCE_HOURS}ч")
-    else:
-        print("[server] Фильтр по времени отключён (TELEGRAM_SINCE_HOURS=0)")
+    print(f"[server] Фильтр по времени: только сообщения за последние {SINCE_HOURS}ч")
     if not OPENROUTER_API_KEY:
         print(
             "[server] ВНИМАНИЕ: OPENROUTER_API_KEY пустой — извлечение вакансий не сработает.",
