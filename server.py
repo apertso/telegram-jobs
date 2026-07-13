@@ -18,11 +18,13 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -39,6 +41,7 @@ CSV_PATH = os.getenv("TELEGRAM_CSV", str(HERE / "telegram.csv"))
 OPENROUTER_API_KEY = (os.getenv("OPENROUTER_API_KEY") or "").strip()
 OPENROUTER_MODEL = (os.getenv("OPENROUTER_MODEL") or "tencent/hy3:free").strip()
 PORT = int(os.getenv("PORT", "3000"))
+SINCE_HOURS = int(os.getenv("TELEGRAM_SINCE_HOURS", "24"))
 
 # Максимальный размер одного сообщения и всего пакета (защита от DoS/ошибок).
 MAX_MESSAGE_TEXT = 8000
@@ -68,6 +71,18 @@ TARGET_STACK = [
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 app = Flask(__name__)
+
+
+def _cleanup_lock() -> None:
+    lock_path = CSV_PATH + ".lock"
+    try:
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+    except OSError:
+        pass
+
+
+atexit.register(_cleanup_lock)
 
 
 # --------------------------------------------------------------------------- #
@@ -269,15 +284,62 @@ def _parse_jobs(raw: str) -> list[JobOut]:
     return jobs
 
 
+# --------------------------------------------------------------------------- #
+# Фильтр по давности сообщений (R4)
+# --------------------------------------------------------------------------- #
+def _parse_published_at(s: str) -> float | None:
+    """Разбирает ISO 8601 метку времени из publishedAt.
+
+    Возвращает epoch-секунды (UTC) или None, если строка пустая/некорректная.
+    Поддерживает суффикс 'Z' и смещения часового пояса.
+    """
+    if not s:
+        return None
+    txt = s.strip()
+    if txt.endswith("Z"):
+        txt = txt[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(txt)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def filter_by_since(messages: list[MessageIn], since_hours: int) -> tuple[list[MessageIn], int]:
+    """Отбрасывает сообщения старше `since_hours` от текущего момента.
+
+    Сообщения без распознаваемой метки publishedAt сохраняются (консервативно:
+    мы не можем определить их возраст и предпочитаем не терять данные).
+    Возвращает (оставленные, количество_отброшенных).
+    Если since_hours <= 0 — фильтрация отключена, возвращается (messages, 0).
+    """
+    if since_hours <= 0:
+        return messages, 0
+    cutoff = time.time() - since_hours * 3600
+    kept: list[MessageIn] = []
+    dropped = 0
+    for m in messages:
+        ts = _parse_published_at(m.publishedAt)
+        if ts is None or ts >= cutoff:
+            kept.append(m)
+        else:
+            dropped += 1
+    return kept, dropped
+
+
 def process_messages(source: str, messages) -> dict:
     """Извлекает вакансии из сообщений источника, нормализует, дедуплицирует
     и записывает новые в CSV. Возвращает словарь статистики."""
     stats = {
         "source": source,
         "messagesReceived": 0,
+        "filteredByTime": 0,
         "jobsExtracted": 0,
         "rowsAdded": 0,
         "duplicates": 0,
+        "skipped": "",
         "errors": [],
     }
 
@@ -294,6 +356,14 @@ def process_messages(source: str, messages) -> dict:
         return stats
 
     stats["messagesReceived"] = len(parsed_msgs)
+
+    # R4: отбрасываем сообщения старше TELEGRAM_SINCE_HOURS.
+    kept_msgs, dropped = filter_by_since(parsed_msgs, SINCE_HOURS)
+    stats["filteredByTime"] = dropped
+    if not kept_msgs:
+        stats["skipped"] = f"Все сообщения старше {SINCE_HOURS}ч (TELEGRAM_SINCE_HOURS)"
+        return stats
+    parsed_msgs = kept_msgs
 
     # 1. Запрос к OpenRouter (только транзиентные повторы).
     try:
@@ -405,6 +475,10 @@ def import_telegram():
 def main():
     print(f"[server] Запуск обработчика на порту {PORT}")
     print(f"[server] CSV: {CSV_PATH}")
+    if SINCE_HOURS > 0:
+        print(f"[server] Фильтр по времени: только сообщения за последние {SINCE_HOURS}ч")
+    else:
+        print("[server] Фильтр по времени отключён (TELEGRAM_SINCE_HOURS=0)")
     if not OPENROUTER_API_KEY:
         print(
             "[server] ВНИМАНИЕ: OPENROUTER_API_KEY пустой — извлечение вакансий не сработает.",

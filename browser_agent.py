@@ -18,6 +18,8 @@ import json
 import os
 import re
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -48,6 +50,11 @@ HIGHLIGHT_BEFORE_CLICK = (os.getenv("HIGHLIGHT_BEFORE_CLICK", "false").lower()
 MAX_MESSAGE_TEXT = 8000
 MAX_MESSAGES = int(os.getenv("TELEGRAM_MESSAGES_LIMIT", "30"))
 
+# Параметры scroll-collect цикла (R4).
+SCROLL_MAX_ITER = int(os.getenv("SCROLL_MAX_ITER", "15"))
+SCROLL_WAIT_MS = int(os.getenv("SCROLL_WAIT_MS", "800"))
+SCROLL_TAIL_TOLERANCE_S = int(os.getenv("SCROLL_TAIL_TOLERANCE_S", "60"))
+
 # Read-only JS для извлечения сообщений из Telegram Web (web.telegram.org/k).
 # НЕ изменяет DOM, storage, cookies или сеть. Только чтение видимых сообщений.
 EXTRACT_MESSAGES_JS = """() => {
@@ -75,7 +82,7 @@ EXTRACT_MESSAGES_JS = """() => {
       .filter(h => h && /^https?:/i.test(h));
     items.push({ mid, ts, text, links });
   }
-  return JSON.stringify(items.slice(-""" + str(MAX_MESSAGES) + """).map(m => ({
+  return JSON.stringify(items.map(m => ({
     messageId: m.mid || '',
     text: m.text,
     publishedAt: toIso(m.ts),
@@ -354,7 +361,6 @@ def _clean_messages(data: dict, source_url: str) -> list[dict]:
             "url": url,
             "links": links,
         })
-    out = out[:MAX_MESSAGES]
     return out
 
 
@@ -383,6 +389,255 @@ def _clean_links(links: list, text: str) -> list[str]:
         seen.add(low)
         keep.append(u)
     return keep
+
+
+# --------------------------------------------------------------------------- #
+# R4: Scroll-collect — сбор сообщений в окне TELEGRAM_SINCE_HOURS
+# --------------------------------------------------------------------------- #
+def _parse_iso_ts(s: str) -> float | None:
+    """Разбирает ISO 8601 метку времени в epoch-секунды (UTC).
+
+    Возвращает None для пустой/некорректной строки. Поддерживает суффикс 'Z'
+    и смещения часового пояса.
+    """
+    if not s:
+        return None
+    txt = str(s).strip()
+    if not txt:
+        return None
+    if txt.endswith("Z"):
+        txt = txt[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(txt)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _detect_scroll_direction(batch: list[dict]) -> tuple[str, str]:
+    """Определяет, в какую сторону скроллить к старым/новым сообщениям.
+
+    Сравнивает publishedAt первого и последнего сообщения в DOM-порядке.
+    Возвращает (older_edge, newer_edge) — каждое 'top' или 'bottom'.
+    Если временные метки отсутствуют или равны — по умолчанию ('top', 'bottom'),
+    что соответствует стандартному расположению чата (старые сверху).
+    """
+    if len(batch) < 2:
+        return "top", "bottom"
+    first_ts = _parse_iso_ts(batch[0].get("publishedAt", ""))
+    last_ts = _parse_iso_ts(batch[-1].get("publishedAt", ""))
+    if first_ts is None or last_ts is None:
+        return "top", "bottom"
+    if first_ts <= last_ts:
+        return "top", "bottom"
+    return "bottom", "top"
+
+
+def _scroll_js(direction: str) -> str:
+    """Возвращает read-only JS для прокрутки контейнера сообщений.
+
+    direction='top' — scrollTop=0 (к старым, если старые сверху).
+    direction='bottom' — scrollTop=scrollHeight (к новым).
+    """
+    if direction == "bottom":
+        return ("() => { const el = document.querySelector('.bubbles-scrollable') "
+                "|| document.querySelector('[class*=\"scroll\"]'); "
+                "if (el) el.scrollTop = el.scrollHeight; }")
+    return ("() => { const el = document.querySelector('.bubbles-scrollable') "
+            "|| document.querySelector('[class*=\"scroll\"]'); "
+            "if (el) el.scrollTop = 0; }")
+
+
+def _merge_by_id(accumulated: dict[str, dict], batch: list[dict]) -> int:
+    """Сливает batch в accumulated (по messageId), возвращает кол-во новых."""
+    new_count = 0
+    for m in batch:
+        mid = m.get("messageId") or ""
+        key = mid or m.get("text", "")[:100]
+        if key not in accumulated:
+            accumulated[key] = m
+            new_count += 1
+    return new_count
+
+
+def _newest_ts(batch: list[dict]) -> float | None:
+    """Самая свежая метка publishedAt в batch (или None)."""
+    best: float | None = None
+    for m in batch:
+        ts = _parse_iso_ts(m.get("publishedAt", ""))
+        if ts is not None and (best is None or ts > best):
+            best = ts
+    return best
+
+
+def _oldest_ts(batch: list[dict]) -> float | None:
+    """Самая старая метка publishedAt в batch (или None)."""
+    best: float | None = None
+    for m in batch:
+        ts = _parse_iso_ts(m.get("publishedAt", ""))
+        if ts is not None and (best is None or ts < best):
+            best = ts
+    return best
+
+
+def _accumulated_oldest_ts(accumulated: dict[str, dict]) -> float | None:
+    """Самая старая метка publishedAt во всём накопленном множестве."""
+    best: float | None = None
+    for m in accumulated.values():
+        ts = _parse_iso_ts(m.get("publishedAt", ""))
+        if ts is not None and (best is None or ts < best):
+            best = ts
+    return best
+
+
+def _has_timestamps(messages: list[dict]) -> bool:
+    """Проверяет, есть ли валидные метки publishedAt хотя бы в половине сообщений.
+
+    Отвергает нереалистичные метки (epoch 0, дальнее будущее).
+    """
+    if not messages:
+        return False
+    now = time.time()
+    ten_years_ago = now - 10 * 365 * 24 * 3600
+    valid = sum(
+        1 for m in messages
+        if (ts := _parse_iso_ts(m.get("publishedAt", ""))) is not None
+        and ten_years_ago < ts <= now + 3600
+    )
+    return valid >= len(messages) // 2
+
+
+async def collect_with_scroll(
+    mcp: "MCPSession",
+    source_url: str,
+    since_hours: int,
+    max_iter: int = SCROLL_MAX_ITER,
+    wait_ms: int = SCROLL_WAIT_MS,
+    tail_tolerance_s: int = SCROLL_TAIL_TOLERANCE_S,
+    extract_js: str | None = None,
+    heal_callback=None,
+) -> list[dict]:
+    """Сбор сообщений из Telegram Web с прокруткой в обе стороны (R4).
+
+    Telegram может открыть канал на последних сообщениях, на первом непрочи-
+    танном, или в глубине истории. Этот цикл:
+      1. Определяет направление к новым/старым сообщениям по publishedAt.
+      2. Фаза 1 — скроллит к новым, пока не достигнет «живого хвоста»
+         (новейшая метка в пределах tail_tolerance_s от now) или пока не
+         перестанут появляться новые сообщения.
+      3. Фаза 2 — скроллит к старым, пока не пройдёт cutoff
+         (now - since_hours*3600) или пока не перестанут появляться новые.
+      4. Сливает все уникальные сообщения, сортирует старые→новые.
+
+    Если после начального извлечения сообщения есть, но метки времени
+    отсутствуют, вызывается heal_callback (если передан) для генерации
+    нового JS с актуальными селекторами. Этот JS используется во всех
+    последующих извлечениях.
+
+    При since_hours <= 0 — одно извлечение без прокрутки (обратная совм.).
+    Возвращает список сообщений; фильтр по времени применяет server.py.
+    """
+    js = extract_js or EXTRACT_MESSAGES_JS
+
+    if since_hours <= 0:
+        raw = await mcp.call("browser_evaluate", {"function": js}, timeout=10)
+        return _parse_evaluate_result(raw, source_url)
+
+    cutoff = time.time() - since_hours * 3600
+    now = time.time()
+    accumulated: dict[str, dict] = {}
+
+    async def _extract() -> list[dict]:
+        raw = await mcp.call("browser_evaluate", {"function": js}, timeout=10)
+        return _parse_evaluate_result(raw, source_url)
+
+    async def _scroll(direction: str) -> None:
+        await mcp.call("browser_evaluate", {"function": _scroll_js(direction)}, timeout=8)
+        await asyncio.sleep(wait_ms / 1000)
+
+    # --- Начальное извлечение и определение направления ---
+    batch = await _extract()
+    _merge_by_id(accumulated, batch)
+
+    # --- Auto-healing: если сообщения есть, но метки времени отсутствуют ---
+    if batch and not _has_timestamps(batch) and heal_callback is not None:
+        log("timestamps missing after initial extract, invoking heal_callback")
+        healed_js = await heal_callback(mcp)
+        if healed_js:
+            js = healed_js
+            log("heal_callback returned new JS, re-extracting")
+            batch = await _extract()
+            accumulated.clear()
+            _merge_by_id(accumulated, batch)
+
+    older_edge, newer_edge = _detect_scroll_direction(batch) if batch else ("top", "bottom")
+
+    # --- Фаза 1: к новым сообщениям (достигаем «живого хвоста») ---
+    no_ts_iter1 = 0
+    for i in range(max_iter):
+        if not batch:
+            break
+        nts = _newest_ts(batch)
+        if nts is not None and (now - nts) <= tail_tolerance_s:
+            log(f"scroll phase1 iter={i}: newest={nts:.0f} within tail tolerance, stop")
+            break
+        if nts is None:
+            no_ts_iter1 += 1
+            if no_ts_iter1 > 3:
+                log(f"scroll phase1 iter={i}: no timestamps after {no_ts_iter1} iterations, stop")
+                break
+        await _scroll(newer_edge)
+        batch = await _extract()
+        new_count = _merge_by_id(accumulated, batch)
+        if new_count == 0:
+            log(f"scroll phase1 iter={i}: no new messages, stop")
+            break
+
+    # --- Фаза 2: к старым сообщениям (до cutoff или дна истории) ---
+    batch = await _extract()
+    acc_oldest_prev: float | None = None
+    no_ts_iter = 0
+    for i in range(max_iter):
+        _merge_by_id(accumulated, batch)
+
+        # Проверяем accumulated set, а не только текущий batch: Telegram
+        # виртуализирует DOM, и старые сообщения могут быть вытеснены из
+        # видимой области, но мы их уже собрали.
+        acc_oldest = _accumulated_oldest_ts(accumulated)
+
+        if acc_oldest is not None:
+            if acc_oldest < cutoff:
+                log(f"scroll phase2 iter={i}: acc_oldest={acc_oldest:.0f} < cutoff={cutoff:.0f}, stop")
+                break
+            # Progress check: если accumulated oldest не уменьшился после
+            # прокрутки — мы не загружаем ничего старше, стоп.
+            if acc_oldest_prev is not None and acc_oldest >= acc_oldest_prev:
+                log(f"scroll phase2 iter={i}: no progress (oldest={acc_oldest:.0f} >= prev={acc_oldest_prev:.0f}), stop")
+                break
+            acc_oldest_prev = acc_oldest
+        else:
+            # Нет валидных меток времени — не можем определить возраст.
+            # Ограничиваем количество итераций, чтобы не уходить в глубину.
+            no_ts_iter += 1
+            if no_ts_iter > 3:
+                log(f"scroll phase2 iter={i}: no timestamps after {no_ts_iter} iterations, stop")
+                break
+
+        if not batch:
+            break
+        await _scroll(older_edge)
+        prev_size = len(accumulated)
+        batch = await _extract()
+        _merge_by_id(accumulated, batch)
+        if len(accumulated) == prev_size:
+            log(f"scroll phase2 iter={i}: no new messages after scroll, stop")
+            break
+
+    merged = list(accumulated.values())
+    merged.sort(key=lambda m: (_parse_iso_ts(m.get("publishedAt", "")) or 0))
+    return merged
 
 
 # --------------------------------------------------------------------------- #

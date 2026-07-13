@@ -469,3 +469,69 @@ def setup_console() -> None:
                 stream.reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
+
+
+def setup_file_logging(path: str = "collect.log") -> object:
+    """Дублирует stdout/stderr в файл лога через logging.
+
+    Файл обрезается при каждом запуске (режим 'w'). Не подменяет sys.stdout/
+    sys.stderr напрямую (это ломает subprocess.Popen, которому нужен fileno()),
+    а использует logging StreamHandler с файловым потоком.
+    """
+    import logging
+    import sys
+
+    logger = logging.getLogger("collect")
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+
+    fh = logging.FileHandler(path, mode="w", encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%H:%M:%S"))
+    logger.addHandler(fh)
+
+    class _StdProxy:
+        """Прокси для stdout/stderr: пишет в оригинальный поток и в лог-файл."""
+        def __init__(self, original, level):
+            self._orig = original
+            self._level = level
+            self._buf = ""
+
+        def write(self, data: str) -> int:
+            try:
+                self._orig.write(data)
+            except Exception:
+                pass
+            self._buf += data
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                if line.strip():
+                    logger.log(self._level, line.rstrip())
+            return len(data)
+
+        def flush(self) -> None:
+            try:
+                self._orig.flush()
+            except Exception:
+                pass
+            if self._buf.strip():
+                logger.log(self._level, self._buf.rstrip())
+                self._buf = ""
+
+        def reconfigure(self, **kwargs) -> None:
+            if hasattr(self._orig, "reconfigure"):
+                try:
+                    self._orig.reconfigure(**kwargs)
+                except Exception:
+                    pass
+
+        @property
+        def encoding(self):
+            return getattr(self._orig, "encoding", "utf-8")
+
+        def fileno(self):
+            return self._orig.fileno()
+
+    sys.stdout = _StdProxy(sys.stdout, logging.INFO)
+    sys.stderr = _StdProxy(sys.stderr, logging.WARNING)
+    return fh

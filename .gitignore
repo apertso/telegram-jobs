@@ -1,6 +1,7 @@
 .env
 .env.example
 *.log
+*.lock
 __pycache__
 node_modules
 .opencode
@@ -8,3 +9,4 @@ latest
 telegram.csv
 project_code.txt
 .playwright-mcp/
+collect.log
