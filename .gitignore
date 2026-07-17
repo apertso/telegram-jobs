@@ -1,5 +1,4 @@
 .env
-.env.example
 *.log
 *.lock
 __pycache__
@@ -10,3 +9,5 @@ telegram.csv
 project_code.txt
 .playwright-mcp/
 collect.log
+telegram_extract_cache.js
+diagnostics/

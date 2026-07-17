@@ -1,17 +1,22 @@
 """Тесты ядра: lib.py и server.process_messages (с моком OpenRouter)."""
 
 import importlib.util
+import contextlib
+import io
 import json
 import os
+import re
 import sys
 import tempfile
 import time as _time
 from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import lib
+import diagnostics
 lib.setup_console()
 
 
@@ -20,6 +25,13 @@ def check(name, got, expected):
     print(("PASS" if ok else "FAIL"), name, "" if ok else f"-> got={got!r} expected={expected!r}")
     if not ok:
         raise SystemExit(1)
+
+
+def read_jsonl(path):
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
 
 
 # --- normalize_work_mode -------------------------------------------------- #
@@ -33,12 +45,25 @@ check("wm office-based", lib.normalize_work_mode("office-based"), "On-site")
 check("wm empty", lib.normalize_work_mode(""), "")
 check("wm unknown", lib.normalize_work_mode("Sometimes"), "")
 
+# --- strip_work_mode_from_location / normalize_job ------------------------ #
+check("strip remote dup", lib.strip_work_mode_from_location("Remote", "Remote"), ("", "Remote"))
+check("strip warsaw unchanged", lib.strip_work_mode_from_location("Warsaw, Poland", "Remote"), ("Warsaw, Poland", "Remote"))
+check("strip infer wm", lib.strip_work_mode_from_location("fully remote", ""), ("", "Remote"))
+nj = lib.normalize_job({"title": "Dev", "company": "Eshe", "location": "Remote", "workMode": "Remote"})
+check("normalize_job strips remote loc", nj["Location"], "")
+check("normalize_job keeps wm", nj["WorkMode"], "Remote")
+
 # --- parse_telegram_source / to_public_tme -------------------------------- #
 check("parse channel", lib.parse_telegram_source("https://web.telegram.org/k/#@evacuatejobs"), ("evacuatejobs", None))
 check("parse thread", lib.parse_telegram_source("https://web.telegram.org/k/#@cyprusithr?thread=46685"), ("cyprusithr", "46685"))
+check("source label channel", lib.source_label("https://web.telegram.org/k/#@evacuatejobs"), "@evacuatejobs")
+check("source label thread", lib.source_label("https://web.telegram.org/k/#@cyprusithr?thread=46685"), "@cyprusithr?thread=46685")
 check("public tme", lib.to_public_tme("https://web.telegram.org/k/#@evacuatejobs"), "https://t.me/evacuatejobs")
 check("public tme thread -> None", lib.to_public_tme("https://web.telegram.org/k/#@cyprusithr?thread=46685"), None)
 check("permalink", lib.message_permalink("https://web.telegram.org/k/#@evacuatejobs", "123"), "https://t.me/evacuatejobs/123")
+check("normalize message id packed", lib.normalize_message_id("4295072879"), "105583")
+check("normalize message id small", lib.normalize_message_id("9"), "9")
+check("permalink with thread", lib.message_permalink("https://web.telegram.org/k/#@cyprusithr?thread=46685", "4295072879"), "https://t.me/cyprusithr/46685/105583")
 
 # --- normalize_url -------------------------------------------------------- #
 check("url strip utm", lib.normalize_url("https://example.com/job?utm_source=x&id=5"), "https://example.com/job?id=5")
@@ -54,22 +79,60 @@ k2 = lib.dedup_key(" senior  dev", " hos247", "Warsaw, Poland", "remote", "https
 check("dedup key normalization", k1, k2)
 k3 = lib.dedup_key("Senior Dev", "HOS247", "Warsaw, Poland", "Remote", "")  # empty url -> no url part
 check("dedup key no-url drops url", k3, "senior dev||hos247||warsaw, poland||remote")
+k4 = lib.dedup_key("Senior Dev", "HOS247", "Warsaw", "Remote", "https://t.me/channel_a/100")
+k5 = lib.dedup_key("Senior Dev", "HOS247", "Warsaw", "Remote", "https://t.me/channel_b/200")
+check("dedup key t.me reposts same key", k4, k5)
 
 # --- is_direct_link ------------------------------------------------------- #
 check("direct external", lib.is_direct_link("https://linkedin.com/jobs/1"), True)
 check("direct t.me not", lib.is_direct_link("https://t.me/evacuatejobs/1"), False)
 check("direct web.telegram not", lib.is_direct_link("https://web.telegram.org/k/#@x"), False)
 
-# --- choose_url ----------------------------------------------------------- #
-msg = {"url": "https://t.me/evacuatejobs/123"}
-check("choose direct", lib.choose_url("https://web.telegram.org/k/#@evacuatejobs", msg, "https://linkedin.com/jobs/1"), "https://linkedin.com/jobs/1")
-check("choose message url fallback", lib.choose_url("https://web.telegram.org/k/#@evacuatejobs", msg, ""), "https://t.me/evacuatejobs/123")
-check("choose public tme fallback", lib.choose_url("https://web.telegram.org/k/#@evacuatejobs", None, ""), "https://t.me/evacuatejobs")
-check("choose source web fallback", lib.choose_url("https://web.telegram.org/k/#@evacuatejobs", None, ""), "https://t.me/evacuatejobs")
+# --- resolve_job_url ------------------------------------------------------ #
+src = "https://web.telegram.org/k/#@evacuatejobs"
+msg = {"messageId": "123", "url": "https://t.me/evacuatejobs/123"}
+check("resolve direct", lib.resolve_job_url(src, msg, "https://linkedin.com/jobs/1"), "https://linkedin.com/jobs/1")
+check("resolve permalink when empty", lib.resolve_job_url(src, msg, ""), "https://t.me/evacuatejobs/123")
+check("resolve permalink ignores t.me from model", lib.resolve_job_url(src, msg, "https://t.me/other/1"), "https://t.me/evacuatejobs/123")
+check("resolve builds permalink from messageId", lib.resolve_job_url(src, {"messageId": "456", "url": ""}, ""), "https://t.me/evacuatejobs/456")
+check("resolve permalink with thread", lib.resolve_job_url(
+    "https://web.telegram.org/k/#@cyprusithr?thread=46685",
+    {"messageId": "105583", "url": ""},
+    "",
+), "https://t.me/cyprusithr/46685/105583")
+check("resolve permalink packed messageId", lib.resolve_job_url(
+    "https://web.telegram.org/k/#@cyprusithr?thread=46685",
+    {"messageId": "4295072879", "url": ""},
+    "",
+), "https://t.me/cyprusithr/46685/105583")
+check("resolve no message no url", lib.resolve_job_url(src, None, ""), "")
 
 # --- add_jobs (CSV roundtrip + dedup) ------------------------------------ #
 tmp = tempfile.mkdtemp()
 csv_path = os.path.join(tmp, "telegram.csv")
+
+# t.me repost dedup: одинаковые вакансии из разных каналов — один ключ.
+csv_repost = os.path.join(tmp, "repost.csv")
+lib.reset_csv(csv_repost)
+repost_jobs = [
+    {"title": "Senior Dev", "company": "HOS247", "location": "Warsaw", "workMode": "Remote",
+     "url": "https://t.me/channel_a/100"},
+    {"title": "Senior Dev", "company": "HOS247", "location": "Warsaw", "workMode": "Remote",
+     "url": "https://t.me/channel_b/200"},
+]
+added_r, dups_r = lib.add_jobs(csv_repost, repost_jobs)
+check("t.me repost added", added_r, 1)
+check("t.me repost dups", dups_r, 1)
+direct_jobs = [
+    {"title": "Senior Dev", "company": "HOS247", "location": "Warsaw", "workMode": "Remote",
+     "url": "https://linkedin.com/jobs/1"},
+    {"title": "Senior Dev", "company": "HOS247", "location": "Warsaw", "workMode": "Remote",
+     "url": "https://linkedin.com/jobs/2"},
+]
+added_d, dups_d = lib.add_jobs(csv_repost, direct_jobs)
+check("different direct urls added", added_d, 2)
+check("different direct urls no dups", dups_d, 0)
+
 jobs = [
     {"title": "Senior Full-Stack Developer", "company": "HOS247", "location": "Warsaw, Poland", "workMode": "Remote", "url": "https://linkedin.com/jobs/1"},
     {"title": "Senior Full-Stack Developer", "company": "HOS247", "location": "Warsaw, Poland", "workMode": "Remote", "url": "https://linkedin.com/jobs/1/"},  # dup (trailing slash)
@@ -87,6 +150,20 @@ jobs2 = [
 added2, dups2 = lib.add_jobs(csv_path, jobs2)
 check("add_jobs2 added", added2, 1)
 check("add_jobs2 dups", dups2, 1)
+
+csv_report = os.path.join(tmp, "report.csv")
+lib.reset_csv(csv_report)
+added_report, dups_report, reports = lib.add_jobs_with_report(csv_report, [
+    {"title": "Senior Dev", "company": "Acme", "location": "Berlin", "workMode": "Remote",
+     "url": "https://jobs.example.com/1"},
+    {"title": "Senior Dev", "company": "Acme", "location": "Berlin", "workMode": "Remote",
+     "url": "https://jobs.example.com/1/"},
+    {"title": "", "company": "", "location": "", "workMode": "", "url": ""},
+])
+check("add_jobs report added", added_report, 1)
+check("add_jobs report dups", dups_report, 1)
+check("add_jobs report results", [r["result"] for r in reports], ["added", "duplicate", "empty"])
+check("add_jobs report dedup key", bool(reports[0]["dedupKey"]), True)
 
 # verify CSV content + quoting
 with open(csv_path, encoding="utf-8") as f:
@@ -135,6 +212,8 @@ check("parse_tabs mcp tabId", tabs2[0]["tabId"], "0")
 check("parse_tabs mcp connect url", "connect.html" in tabs2[0]["url"], True)
 check("parse_tabs mcp tab2 id", tabs2[1]["tabId"], "1")
 check("parse_tabs mcp tab2 url", "web.telegram.org" in tabs2[1]["url"], True)
+check("parse_tabs mcp current", tabs2[0].get("current"), True)
+check("parse_tabs mcp current_tab_id", ba.current_tab_id(tabs2), "0")
 
 # Пустой результат
 check("parse_tabs empty", ba._parse_tabs(""), [])
@@ -146,20 +225,22 @@ print("\n[browser_agent._parse_tabs] все проверки пройдены")
 # --- server.process_messages с моком OpenRouter -------------------------- #
 import server as server_mod
 
-# Мок ответа модели: одно сообщение с двумя подходящими вакансиями.
-FAKE_MODEL_RESPONSE = json.dumps({
-    "jobs": [
-        {"title": "Senior Full-Stack Developer", "company": "HOS247",
-         "location": "Warsaw, Mazowieckie, Poland", "workMode": "fully remote",
-         "url": "https://www.linkedin.com/jobs/view/4410073565/"},
-        {"title": "React Developer", "company": "HOS247",
-         "location": "Warsaw, Poland", "workMode": "remote",
-         "url": "https://t.me/evacuatejobs/9"},  # t.me -> должно остаться как priority 2
-    ]
-})
-
 def fake_call(model, user_prompt):
-    return FAKE_MODEL_RESPONSE
+    match = re.search(r"\bid=([^\s]+)", user_prompt)
+    mid = match.group(1) if match else "9"
+    return json.dumps({
+        "jobs": [
+            {"messageId": mid, "title": "Senior Angular Developer", "company": "HOS247",
+             "location": "Warsaw, Mazowieckie, Poland", "workMode": "fully remote",
+             "url": "https://www.linkedin.com/jobs/view/4410073565/",
+             "matchedDirection": "Frontend", "matchedStack": "Angular",
+             "evidence": "Angular Developer"},
+            {"messageId": mid, "title": "React Developer", "company": "HOS247",
+             "location": "Warsaw, Poland", "workMode": "remote",
+             "url": "", "matchedDirection": "Frontend", "matchedStack": "React",
+             "evidence": "React Developer"},
+        ]
+    })
 
 server_mod._call_openrouter = fake_call
 
@@ -171,7 +252,7 @@ try:
     stats = server_mod.process_messages(
         "https://web.telegram.org/k/#@evacuatejobs",
         [
-            {"messageId": "9", "text": "We are hiring...", "publishedAt": fresh_at,
+            {"messageId": "9", "text": "Senior Angular Developer and React Developer", "publishedAt": fresh_at,
              "url": "https://t.me/evacuatejobs/9", "links": ["https://www.linkedin.com/jobs/view/4410073565/"]},
         ],
     )
@@ -189,6 +270,282 @@ with open(csv2, encoding="utf-8") as f:
     print(f.read())
 
 print("\n[server] process_messages OK")
+
+
+# --- Target direction is enough without matchedStack ---------------------- #
+_orig_direction_call = server_mod._call_openrouter
+csv_direction = os.path.join(tmp, "telegram_direction.csv")
+orig_csv_direction = server_mod.CSV_PATH
+
+def fake_frontend_no_stack(model, user_prompt):
+    match = re.search(r"\bid=([^\s]+)", user_prompt)
+    mid = match.group(1) if match else "fe1"
+    return json.dumps({
+        "jobs": [
+            {
+                "messageId": mid,
+                "title": "Senior Frontend Developer",
+                "company": "Acme",
+                "location": "Remote",
+                "workMode": "Remote",
+                "url": "",
+                "matchedDirection": "Frontend",
+                "matchedStack": "",
+                "evidence": "Frontend Developer",
+            },
+        ],
+    })
+
+server_mod._call_openrouter = fake_frontend_no_stack
+server_mod.CSV_PATH = csv_direction
+try:
+    lib.reset_csv(csv_direction)
+    stats_direction = server_mod.process_messages(
+        "https://web.telegram.org/k/#@JobBroadcast",
+        [
+            {
+                "messageId": "fe1",
+                "text": "Senior Frontend Developer at Acme. Details by link.",
+                "publishedAt": fresh_at,
+                "url": "https://t.me/JobBroadcast/1",
+                "links": [],
+            },
+        ],
+    )
+finally:
+    server_mod._call_openrouter = _orig_direction_call
+    server_mod.CSV_PATH = orig_csv_direction
+
+check("frontend stackless extracted", stats_direction["jobsExtracted"], 1)
+check("frontend stackless rejected", stats_direction["jobsRejected"], 0)
+check("frontend stackless rows", stats_direction["rowsAdded"], 1)
+
+row_full_stack, reason_full_stack = server_mod._validated_job_row(
+    "https://web.telegram.org/k/#@JobBroadcast",
+    server_mod.JobOut(
+        messageId="fs2",
+        title="Senior Full Stack Developer",
+        company="Acme",
+        matchedDirection="Full-Stack",
+        matchedStack="",
+        evidence="Full Stack Developer",
+    ),
+    {
+        "fs2": server_mod.MessageIn(
+            messageId="fs2",
+            text="Senior Full Stack Developer at Acme. Details by link.",
+            publishedAt=fresh_at,
+            url="https://t.me/JobBroadcast/2",
+            links=[],
+        ),
+    },
+)
+check("full stack stackless direction", row_full_stack is not None, True)
+check("full stack stackless no reject reason", reason_full_stack, None)
+
+row_backend, reason_backend = server_mod._validated_job_row(
+    "https://web.telegram.org/k/#@JobBroadcast",
+    server_mod.JobOut(
+        messageId="be1",
+        title="Backend Engineer",
+        company="Acme",
+        matchedDirection="Backend",
+        matchedStack="",
+        evidence="Backend Engineer",
+    ),
+    {
+        "be1": server_mod.MessageIn(
+            messageId="be1",
+            text="Backend Engineer at Acme. Details by link.",
+            publishedAt=fresh_at,
+            url="https://t.me/JobBroadcast/3",
+            links=[],
+        ),
+    },
+)
+check("backend stackless direction", row_backend is not None, True)
+check("backend stackless no reject reason", reason_backend, None)
+
+row_plain, reason_plain = server_mod._validated_job_row(
+    "https://web.telegram.org/k/#@JobBroadcast",
+    server_mod.JobOut(
+        messageId="plain1",
+        title="Senior Frontend Developer",
+        company="Acme",
+        matchedDirection="Frontend",
+        matchedStack="",
+        evidence="Developer role",
+    ),
+    {
+        "plain1": server_mod.MessageIn(
+            messageId="plain1",
+            text="Developer role at Acme. Details by link.",
+            publishedAt=fresh_at,
+            url="https://t.me/JobBroadcast/4",
+            links=[],
+        ),
+    },
+)
+check("plain developer without direction rejected", row_plain, None)
+check("plain developer without direction reason", reason_plain, "candidate evidence lacks matched direction or stack")
+
+row_contaminated, reason_contaminated = server_mod._validated_job_row(
+    "https://web.telegram.org/k/#@JobBroadcast",
+    server_mod.JobOut(
+        messageId="multi1",
+        title="Project Manager",
+        company="BizCo",
+        matchedDirection="Frontend",
+        matchedStack="",
+        evidence="Project Manager",
+    ),
+    {
+        "multi1": server_mod.MessageIn(
+            messageId="multi1",
+            text="Frontend Developer at Acme\nProject Manager at BizCo",
+            publishedAt=fresh_at,
+            url="https://t.me/JobBroadcast/5",
+            links=[],
+        ),
+    },
+)
+check("multi vacancy direction contamination rejected", row_contaminated, None)
+check(
+    "multi vacancy contamination reason",
+    reason_contaminated,
+    "candidate evidence lacks matched direction or stack",
+)
+
+row_react, reason_react = server_mod._validated_job_row(
+    "https://web.telegram.org/k/#@JobBroadcast",
+    server_mod.JobOut(
+        messageId="multi2",
+        title="React Developer",
+        company="Acme",
+        matchedDirection="Frontend",
+        matchedStack="React",
+        evidence="React Developer",
+    ),
+    {
+        "multi2": server_mod.MessageIn(
+            messageId="multi2",
+            text="React Developer at Acme\nFrontend Developer at BizCo",
+            publishedAt=fresh_at,
+            url="https://t.me/JobBroadcast/6",
+            links=[],
+        ),
+    },
+)
+check("multi vacancy stack evidence accepted", row_react is not None, True)
+check("multi vacancy stack evidence no reject reason", reason_react, None)
+
+def fake_three_jobs_one_message(model, user_prompt):
+    return json.dumps({
+        "jobs": [
+            {
+                "messageId": "multi3",
+                "title": "React Developer",
+                "company": "Acme",
+                "location": "",
+                "workMode": "Remote",
+                "url": "",
+                "matchedDirection": "Frontend",
+                "matchedStack": "React",
+                "evidence": "React Developer",
+            },
+            {
+                "messageId": "multi3",
+                "title": "Python Engineer",
+                "company": "PyCo",
+                "location": "",
+                "workMode": "Remote",
+                "url": "",
+                "matchedDirection": "Backend",
+                "matchedStack": "Python",
+                "evidence": "Python Engineer",
+            },
+            {
+                "messageId": "multi3",
+                "title": "Frontend Developer",
+                "company": "WebCo",
+                "location": "",
+                "workMode": "Remote",
+                "url": "",
+                "matchedDirection": "Frontend",
+                "matchedStack": "",
+                "evidence": "Frontend Developer",
+            },
+        ],
+    })
+
+server_mod._call_openrouter = fake_three_jobs_one_message
+server_mod.CSV_PATH = csv_direction
+try:
+    lib.reset_csv(csv_direction)
+    stats_multi_jobs = server_mod.process_messages(
+        "https://web.telegram.org/k/#@JobBroadcast",
+        [
+            {
+                "messageId": "multi3",
+                "text": "React Developer at Acme\nPython Engineer at PyCo\nFrontend Developer at WebCo",
+                "publishedAt": fresh_at,
+                "url": "https://t.me/JobBroadcast/7",
+                "links": [],
+            },
+        ],
+    )
+    rows_multi_jobs = lib.read_rows(csv_direction)
+finally:
+    server_mod._call_openrouter = _orig_direction_call
+    server_mod.CSV_PATH = orig_csv_direction
+
+check("one message multiple jobs extracted", stats_multi_jobs["jobsExtracted"], 2)
+check("one message multiple jobs rejected", stats_multi_jobs["jobsRejected"], 1)
+check("one message multiple jobs rows", stats_multi_jobs["rowsAdded"], 2)
+check("one message multiple jobs titles", {r["Title"] for r in rows_multi_jobs}, {"React Developer", "Frontend Developer"})
+
+if os.path.exists(csv_direction):
+    os.remove(csv_direction)
+if os.path.exists(csv_direction + ".lock"):
+    os.remove(csv_direction + ".lock")
+
+print("\n[server] Направление без matchedStack OK")
+
+
+# --- append_collect_log + process_messages stage logging --------------- #
+log_path = os.path.join(tmp, "stage.log")
+lib.append_collect_log(log_path, "[@x] test line")
+with open(log_path, encoding="utf-8") as f:
+    log_lines = f.read().splitlines()
+check("append_collect_log writes line", len(log_lines), 1)
+check("append_collect_log content", log_lines[0].endswith("[@x] test line"), True)
+
+orig_log = server_mod.COLLECT_LOG_PATH
+orig_csv_stage = server_mod.CSV_PATH
+csv_stage = os.path.join(tmp, "telegram_stage.csv")
+server_mod.COLLECT_LOG_PATH = log_path
+server_mod.CSV_PATH = csv_stage
+lib.reset_csv(csv_stage)
+try:
+    stats_log = server_mod.process_messages(
+        "https://web.telegram.org/k/#@evacuatejobs",
+        [
+            {"messageId": "9", "text": "Senior Angular Developer and React Developer", "publishedAt": fresh_at,
+             "url": "https://t.me/evacuatejobs/9", "links": []},
+        ],
+    )
+finally:
+    server_mod.COLLECT_LOG_PATH = orig_log
+    server_mod.CSV_PATH = orig_csv_stage
+
+with open(log_path, encoding="utf-8") as f:
+    stage_text = f.read()
+check("stage log OpenRouter request", "OpenRouter: запрос" in stage_text, True)
+check("stage log OpenRouter response", "OpenRouter: ответ" in stage_text, True)
+check("stage log CSV", "CSV: +2 строк" in stage_text, True)
+check("stage log jobs parsed", stats_log["jobsExtracted"], 2)
+
+print("\n[server] stage logging OK")
 
 
 # --- server._cleanup_lock (atexit) --------------------------------------- #
@@ -249,15 +606,22 @@ stale = _Msg(text="stale", publishedAt=_iso(-48))    # 48ч назад — ст�
 no_ts = _Msg(text="no-ts", publishedAt="")            # без метки
 
 kept, dropped = server_mod.filter_by_since([fresh, stale, no_ts], 24)
-check("filter keeps fresh", len(kept), 2)             # fresh + no_ts
-check("filter drops stale", dropped, 1)
-check("filter keeps no-ts in kept", any(m.text == "no-ts" for m in kept), True)
+check("filter keeps fresh", len(kept), 1)
+check("filter drops stale and no-ts", dropped, 2)
+check("filter drops no-ts", any(m.text == "no-ts" for m in kept), False)
 check("filter drops stale not in kept", any(m.text == "stale" for m in kept), False)
 
 # все старые — все отброшены
 kept_all_old, dropped_all_old = server_mod.filter_by_since([stale, stale], 24)
 check("filter all old kept", len(kept_all_old), 0)
 check("filter all old dropped", dropped_all_old, 2)
+
+# prefilter — широкий, но отсекает очевидный мусор.
+check("prefilter Senior Developer", server_mod.should_send_to_model({"text": "Senior Developer"}), True)
+check("prefilter ru frontend", server_mod.should_send_to_model({"text": "Фронтенд"}), True)
+check("prefilter Angular Developer", server_mod.should_send_to_model({"text": "Angular Developer"}), True)
+check("prefilter short JS", server_mod.should_send_to_model({"text": "JS"}), True)
+check("prefilter ad noise", server_mod.should_send_to_model({"text": "Большая распродажа и новости недели"}), False)
 
 # интеграционный тест: process_messages возвращает filteredByTime
 csv4 = os.path.join(tmp, "telegram4.csv")
@@ -270,9 +634,9 @@ try:
     stats4 = server_mod.process_messages(
         "https://web.telegram.org/k/#@evacuatejobs",
         [
-            {"messageId": "1", "text": "fresh job", "publishedAt": _iso(-1),
+            {"messageId": "1", "text": "Senior Angular Developer and React Developer", "publishedAt": _iso(-1),
              "url": "", "links": []},
-            {"messageId": "2", "text": "old job", "publishedAt": _iso(-100),
+            {"messageId": "2", "text": "old Angular Developer", "publishedAt": _iso(-100),
              "url": "", "links": []},
         ],
     )
@@ -296,9 +660,9 @@ try:
     stats5 = server_mod.process_messages(
         "https://web.telegram.org/k/#@evacuatejobs",
         [
-            {"messageId": "1", "text": "old job 1", "publishedAt": _iso(-100),
+            {"messageId": "1", "text": "old Angular Developer 1", "publishedAt": _iso(-100),
              "url": "", "links": []},
-            {"messageId": "2", "text": "old job 2", "publishedAt": _iso(-200),
+            {"messageId": "2", "text": "old React Developer 2", "publishedAt": _iso(-200),
              "url": "", "links": []},
         ],
     )
@@ -313,7 +677,297 @@ finally:
     if os.path.exists(csv5 + ".lock"):
         os.remove(csv5 + ".lock")
 
+# все без метки — отброшены, skipped
+csv6 = os.path.join(tmp, "telegram6.csv")
+server_mod.CSV_PATH = csv6
+try:
+    lib.reset_csv(csv6)
+    stats6 = server_mod.process_messages(
+        "https://web.telegram.org/k/#@evacuatejobs",
+        [
+            {"messageId": "1", "text": "no ts Angular Developer", "publishedAt": "",
+             "url": "", "links": []},
+        ],
+    )
+    check("process no-ts filteredByTime", stats6["filteredByTime"], 1)
+    check("process no-ts skipped", bool(stats6.get("skipped", "")), True)
+    check("process no-ts no csv rows", len(lib.read_rows(csv6)), 0)
+finally:
+    server_mod.CSV_PATH = orig_csv
+    server_mod.SINCE_HOURS = orig_since
+    if os.path.exists(csv6):
+        os.remove(csv6)
+    if os.path.exists(csv6 + ".lock"):
+        os.remove(csv6 + ".lock")
+
 print("\n[server.filter_by_since] все проверки пройдены")
+
+
+# --- _parse_jobs: messageId как int от модели -------------------------------- #
+int_id_response = json.dumps({
+    "jobs": [{"messageId": 4295072879, "title": "Dev", "company": "", "location": "",
+              "workMode": "Remote", "url": ""}]
+})
+parsed_int = server_mod._parse_jobs(int_id_response)
+check("parse_jobs int messageId", parsed_int[0].messageId, "105583")
+
+loc_response = json.dumps({
+    "jobs": [{"messageId": "1", "title": "Dev", "company": "Eshe",
+              "location": "Remote", "workMode": "Remote", "url": ""}]
+})
+parsed_loc = server_mod._parse_jobs(loc_response)
+check("parse_jobs strips remote location", parsed_loc[0].location, "")
+check("parse_jobs keeps workMode", parsed_loc[0].workMode, "Remote")
+
+print("\n[server._parse_jobs] все проверки пройдены")
+
+
+# --- server chunking + strict validation ---------------------------------- #
+chunk_messages = [
+    _Msg(messageId=str(i), text=f"Senior Angular Developer {i}", publishedAt=_iso(-1))
+    for i in range(20)
+]
+chunks = server_mod._chunk_messages("https://web.telegram.org/k/#@evacuatejobs", chunk_messages)
+check("chunking 20 messages -> 3 chunks", len(chunks), 3)
+check("chunking first chunk size", len(chunks[0]), 8)
+check("chunking last chunk size", len(chunks[-1]), 4)
+
+_chunk_calls = []
+
+def _fake_empty_chunks(model, user_prompt):
+    _chunk_calls.append(user_prompt)
+    return json.dumps({"jobs": []})
+
+_orig_call = server_mod._call_openrouter
+server_mod._call_openrouter = _fake_empty_chunks
+csv_chunks = os.path.join(tmp, "telegram_chunks.csv")
+server_mod.CSV_PATH = csv_chunks
+try:
+    lib.reset_csv(csv_chunks)
+    stats_chunks = server_mod.process_messages(
+        "https://web.telegram.org/k/#@evacuatejobs",
+        [
+            {"messageId": str(i), "text": f"Senior Angular Developer {i}", "publishedAt": _iso(-1),
+             "url": "", "links": []}
+            for i in range(20)
+        ],
+    )
+    check("process chunk model requests", stats_chunks["modelRequests"], 3)
+    check("process chunk call count", len(_chunk_calls), 3)
+finally:
+    server_mod._call_openrouter = _orig_call
+    server_mod.CSV_PATH = orig_csv
+    if os.path.exists(csv_chunks):
+        os.remove(csv_chunks)
+    if os.path.exists(csv_chunks + ".lock"):
+        os.remove(csv_chunks + ".lock")
+
+strict_response = json.dumps({
+    "jobs": [
+        {"messageId": "1", "title": "Senior Angular Developer", "company": "GoodCo",
+         "location": "Berlin", "workMode": "Remote",
+         "url": "https://jobs.example.com/angular?utm_source=x",
+         "matchedDirection": "Frontend", "matchedStack": "Angular",
+         "evidence": "Angular Developer"},
+        {"messageId": "404", "title": "Senior Angular Developer", "company": "GoodCo",
+         "location": "", "workMode": "Remote", "url": "",
+         "matchedDirection": "Frontend", "matchedStack": "Angular",
+         "evidence": "Angular Developer"},
+        {"messageId": "1", "title": "", "company": "GoodCo",
+         "location": "", "workMode": "Remote", "url": "",
+         "matchedDirection": "Frontend", "matchedStack": "Angular",
+         "evidence": "Angular Developer"},
+        {"messageId": "1", "title": "Vue Developer", "company": "GoodCo",
+         "location": "", "workMode": "Remote", "url": "",
+         "matchedDirection": "Frontend", "matchedStack": "Angular",
+         "evidence": "Vue Developer"},
+        {"messageId": "1", "title": "Python Developer", "company": "GoodCo",
+         "location": "", "workMode": "Remote", "url": "",
+         "matchedDirection": "Backend", "matchedStack": "Python",
+         "evidence": "Angular Developer"},
+        {"messageId": "1", "title": "!!!", "company": "",
+         "location": "", "workMode": "Remote", "url": "",
+         "matchedDirection": "Frontend", "matchedStack": "Angular",
+         "evidence": "Angular Developer"},
+        {"messageId": "1", "title": "React Developer", "company": "GoodCo",
+         "location": "Berlin", "workMode": "Remote",
+         "url": "https://evil.test/job",
+         "matchedDirection": "Frontend", "matchedStack": "React",
+         "evidence": "React Developer"},
+    ]
+})
+
+def _fake_strict(model, user_prompt):
+    return strict_response
+
+server_mod._call_openrouter = _fake_strict
+csv_strict = os.path.join(tmp, "telegram_strict.csv")
+server_mod.CSV_PATH = csv_strict
+try:
+    lib.reset_csv(csv_strict)
+    stats_strict = server_mod.process_messages(
+        "https://web.telegram.org/k/#@evacuatejobs",
+        [
+            {"messageId": "1", "text": "Senior Angular Developer and React Developer at GoodCo",
+             "publishedAt": _iso(-1), "url": "https://t.me/evacuatejobs/1",
+             "links": ["https://jobs.example.com/angular"]},
+        ],
+    )
+    rows_strict = lib.read_rows(csv_strict)
+    strict_urls = {r["URL"] for r in rows_strict}
+    check("strict accepted jobs", stats_strict["jobsExtracted"], 2)
+    check("strict rejected jobs", stats_strict["jobsRejected"], 5)
+    check("strict rows added", stats_strict["rowsAdded"], 2)
+    check("strict keeps linked url", "https://jobs.example.com/angular" in strict_urls, True)
+    check("strict arbitrary url falls back", "https://t.me/evacuatejobs/1" in strict_urls, True)
+finally:
+    server_mod._call_openrouter = fake_call
+    server_mod.CSV_PATH = orig_csv
+    if os.path.exists(csv_strict):
+        os.remove(csv_strict)
+    if os.path.exists(csv_strict + ".lock"):
+        os.remove(csv_strict + ".lock")
+
+print("\n[server chunking + strict validation] все проверки пройдены")
+
+
+# --- AI diagnostics ------------------------------------------------------- #
+_diag_env_keys = [
+    "AI_DIAGNOSTICS_ENABLED",
+    "AI_DIAGNOSTICS_RUN_ID",
+    "OPENROUTER_API_KEY",
+]
+_diag_env_orig = {k: os.environ.get(k) for k in _diag_env_keys}
+_orig_diag_dir = diagnostics.DIAGNOSTICS_DIR
+_orig_diag_call = server_mod._call_openrouter
+_orig_diag_csv = server_mod.CSV_PATH
+_orig_diag_since = server_mod.SINCE_HOURS
+try:
+    disabled_dir = os.path.join(tmp, "diag_disabled")
+    diagnostics.DIAGNOSTICS_DIR = Path(disabled_dir)
+    os.environ["AI_DIAGNOSTICS_ENABLED"] = "false"
+    diagnostics.write_log("messages", {"source": "x", "stage": "test"})
+    check("diagnostics disabled no file", os.path.exists(os.path.join(disabled_dir, "messages.jsonl")), False)
+
+    secret_value = "sk-or-v1-testsecretvalue123456"
+    os.environ["OPENROUTER_API_KEY"] = secret_value
+    sanitized = diagnostics.sanitize({
+        "api_key": secret_value,
+        "text": "Senior token engineer role",
+        "nested": {"authorization": "Bearer abcdefghijklmnop"},
+        "url": "https://example.test/path?token=abcdefghijklmnop&ok=1",
+    })
+    check("diagnostics sanitizer key", sanitized["api_key"], "[REDACTED]")
+    check("diagnostics sanitizer normal text", sanitized["text"], "Senior token engineer role")
+    check("diagnostics sanitizer auth", sanitized["nested"]["authorization"], "[REDACTED]")
+    check("diagnostics sanitizer query", "token=[REDACTED]" in sanitized["url"], True)
+
+    diag_dir = os.path.join(tmp, "diag_enabled")
+    diagnostics.DIAGNOSTICS_DIR = Path(diag_dir)
+    os.environ["AI_DIAGNOSTICS_ENABLED"] = "true"
+    os.environ["AI_DIAGNOSTICS_RUN_ID"] = "test-run"
+    os.makedirs(diag_dir, exist_ok=True)
+    stale_path = os.path.join(diag_dir, "messages.jsonl")
+    with open(stale_path, "w", encoding="utf-8") as f:
+        f.write("{}\n")
+    diagnostics.clean_start()
+    check("diagnostics clean start removes stale", os.path.exists(stale_path), False)
+
+    diag_response = json.dumps({
+        "jobs": [
+            {"messageId": "1", "title": "Senior Angular Developer", "company": "GoodCo",
+             "location": "Berlin", "workMode": "Remote", "url": "",
+             "matchedDirection": "Frontend", "matchedStack": "Angular",
+             "evidence": "Angular Developer"},
+            {"messageId": "1", "title": "Senior Angular Developer", "company": "GoodCo",
+             "location": "Berlin", "workMode": "Remote", "url": "",
+             "matchedDirection": "Frontend", "matchedStack": "Angular",
+             "evidence": "Angular Developer"},
+            {"messageId": "1", "title": "", "company": "GoodCo",
+             "location": "Berlin", "workMode": "Remote", "url": "",
+             "matchedDirection": "Frontend", "matchedStack": "Angular",
+             "evidence": "Angular Developer"},
+        ]
+    })
+
+    def _fake_diag(model, user_prompt):
+        return diag_response
+
+    server_mod._call_openrouter = _fake_diag
+    server_mod.CSV_PATH = os.path.join(tmp, "telegram_diag.csv")
+    server_mod.SINCE_HOURS = 24
+    lib.reset_csv(server_mod.CSV_PATH)
+    stats_diag = server_mod.process_messages(
+        "https://web.telegram.org/k/#@evacuatejobs",
+        [
+            {"messageId": "1", "text": "Senior Angular Developer at GoodCo", "publishedAt": _iso(-1),
+             "url": "https://t.me/evacuatejobs/1", "links": []},
+            {"messageId": "2", "text": "Большая распродажа и новости недели", "publishedAt": _iso(-1),
+             "url": "https://t.me/evacuatejobs/2", "links": []},
+            {"messageId": "3", "text": "old Angular Developer", "publishedAt": _iso(-100),
+             "url": "https://t.me/evacuatejobs/3", "links": []},
+        ],
+    )
+    check("diagnostics stats rejected", stats_diag["jobsRejected"], 1)
+    check("diagnostics stats duplicates", stats_diag["duplicates"], 1)
+    check("diagnostics stats rows", stats_diag["rowsAdded"], 1)
+
+    msg_records = read_jsonl(os.path.join(diag_dir, "messages.jsonl"))
+    req_records = read_jsonl(os.path.join(diag_dir, "ai_requests.jsonl"))
+    resp_records = read_jsonl(os.path.join(diag_dir, "ai_responses.jsonl"))
+    job_records = read_jsonl(os.path.join(diag_dir, "jobs.jsonl"))
+    check("diagnostics message time pass", any(r.get("reasonCode") == "passed_time_filter" for r in msg_records), True)
+    check("diagnostics message time reject", any(r.get("reasonCode") == "older_than_since_hours" for r in msg_records), True)
+    check("diagnostics message prefilter pass", any(r.get("reasonCode") == "passed_prefilter" for r in msg_records), True)
+    check("diagnostics message prefilter reject", any(r.get("reasonCode") == "rejected_prefilter" for r in msg_records), True)
+    check("diagnostics message ai sent", any(r.get("reasonCode") == "sent_to_ai" for r in msg_records), True)
+    check("diagnostics request messages", any("Senior Angular Developer" in r["messages"][1]["content"] for r in req_records), True)
+    check("diagnostics response raw", any(r.get("rawResponse") == diag_response for r in resp_records), True)
+    check("diagnostics job validation accepted", any(r.get("stage") == "validation" and r.get("outcome") == "accepted" for r in job_records), True)
+    check("diagnostics job validation rejected", any(r.get("stage") == "validation" and r.get("reasonCode") == "empty_title" for r in job_records), True)
+    check("diagnostics job dedup added", any(r.get("stage") == "deduplication" and r.get("outcome") == "added" for r in job_records), True)
+    check("diagnostics job dedup duplicate", any(r.get("stage") == "deduplication" and r.get("outcome") == "duplicate" for r in job_records), True)
+
+    diagnostics.clean_start()
+
+    def _fake_bad_json(model, user_prompt):
+        return "not json"
+
+    server_mod._call_openrouter = _fake_bad_json
+    lib.reset_csv(server_mod.CSV_PATH)
+    stats_bad = server_mod.process_messages(
+        "https://web.telegram.org/k/#@evacuatejobs",
+        [
+            {"messageId": "1", "text": "Senior Angular Developer", "publishedAt": _iso(-1),
+             "url": "https://t.me/evacuatejobs/1", "links": []},
+        ],
+    )
+    bad_jobs = read_jsonl(os.path.join(diag_dir, "jobs.jsonl"))
+    bad_responses = read_jsonl(os.path.join(diag_dir, "ai_responses.jsonl"))
+    check("diagnostics parse failure errors", bool(stats_bad["errors"]), True)
+    check("diagnostics parse failure raw response", any(r.get("rawResponse") == "not json" for r in bad_responses), True)
+    check("diagnostics parse failure job event", any(r.get("stage") == "parsing" and r.get("rawResponse") == "not json" for r in bad_jobs), True)
+
+    with open(os.path.join(HERE, ".gitignore"), encoding="utf-8") as f:
+        gitignore_text = f.read()
+    with open(os.path.join(HERE, ".env.example"), encoding="utf-8") as f:
+        env_example_text = f.read()
+    check("gitignore diagnostics dir", "diagnostics/" in gitignore_text, True)
+    check("env diagnostics enabled", "AI_DIAGNOSTICS_ENABLED=false" in env_example_text, True)
+    check("env diagnostics dir removed", "AI_DIAGNOSTICS_DIR" in env_example_text, False)
+    check("env diagnostics clean removed", "AI_DIAGNOSTICS_CLEAN_ON_START" in env_example_text, False)
+finally:
+    diagnostics.DIAGNOSTICS_DIR = _orig_diag_dir
+    server_mod._call_openrouter = _orig_diag_call
+    server_mod.CSV_PATH = _orig_diag_csv
+    server_mod.SINCE_HOURS = _orig_diag_since
+    for _k, _v in _diag_env_orig.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
+
+print("\n[diagnostics] все проверки пройдены")
 
 
 # --- R4: scroll-collect helpers (browser_agent) -------------------------- #
@@ -339,6 +993,16 @@ check("dir new-first -> bottom is older", ba._detect_scroll_direction(new_first)
 check("dir single -> default", ba._detect_scroll_direction([{"publishedAt": fresh_iso}]), ("top", "bottom"))
 check("dir no-ts -> default", ba._detect_scroll_direction([{"publishedAt": ""}, {"publishedAt": ""}]), ("top", "bottom"))
 
+# _has_timestamps
+check("has_timestamps single no-ts", ba._has_timestamps([{"publishedAt": ""}]), False)
+check("has_timestamps single fresh", ba._has_timestamps([{"publishedAt": fresh_iso}]), True)
+check("has_timestamps majority ok", ba._has_timestamps([
+    {"publishedAt": fresh_iso}, {"publishedAt": ""},
+]), True)
+check("has_timestamps minority fails", ba._has_timestamps([
+    {"publishedAt": fresh_iso}, {"publishedAt": ""}, {"publishedAt": ""},
+]), False)
+
 # _merge_by_id
 acc: dict = {}
 n = ba._merge_by_id(acc, [{"messageId": "a", "text": "x"}, {"messageId": "b", "text": "y"}])
@@ -351,6 +1015,21 @@ check("merge size after dedup", len(acc), 3)
 # _scroll_js
 check("scroll top js has scrollTop=0", "scrollTop = 0" in ba._scroll_js("top"), True)
 check("scroll bottom js has scrollHeight", "scrollHeight" in ba._scroll_js("bottom"), True)
+check("scroll state parser bottom", ba._scroll_at_bottom_from_eval('{"found":true,"atBottom":true}'), True)
+check(
+    "scroll state parser numeric",
+    ba._scroll_at_bottom_from_eval('{"found":true,"scrollTop":90,"clientHeight":100,"scrollHeight":195}'),
+    True,
+)
+check("scroll state parser missing", ba._scroll_at_bottom_from_eval('{"found":false}'), None)
+
+# _batch_summary
+summary = ba._batch_summary([
+    {"messageId": "a", "publishedAt": old_iso},
+    {"messageId": "b", "publishedAt": fresh_iso},
+])
+check("batch summary count", summary.startswith("batch=2, ts="), True)
+check("batch summary ids", summary.endswith(", ids=a..b"), True)
 
 print("\n[browser_agent scroll helpers] все проверки пройдены")
 
@@ -367,20 +1046,33 @@ class _FakeMCP:
     каждого вызова browser_evaluate с EXTRACT_MESSAGES_JS.
     Вызовы со scrollTop (прокрутка) — no-op, считаются в scroll_count.
     """
-    def __init__(self, extract_responses):
+    def __init__(self, extract_responses, at_bottom=None):
         self._r = list(extract_responses)
         self._i = 0
         self.scroll_count = 0
+        self.extract_count = 0
+        self.at_bottom = at_bottom
 
     async def call(self, tool, args, timeout=None):
         if tool != "browser_evaluate":
             return ""
         fn = args.get("function", "")
-        if "scrollTop" in fn:
+        if "atBottom" in fn and "clientHeight" in fn and "scrollHeight" in fn:
+            if self.at_bottom is None:
+                return json.dumps({"found": False, "atBottom": False})
+            return json.dumps({
+                "found": True,
+                "atBottom": self.at_bottom,
+                "scrollTop": 190 if self.at_bottom else 0,
+                "clientHeight": 100,
+                "scrollHeight": 290,
+            })
+        if "el.scrollTop =" in fn:
             self.scroll_count += 1
             return "ok"
         r = self._r[min(self._i, len(self._r) - 1)]
         self._i += 1
+        self.extract_count += 1
         return r
 
 
@@ -388,8 +1080,8 @@ class _FakeMCP:
 #   extract 0 (initial): 2 old messages
 #   phase 1 scroll newer -> extract 1: 2 fresh messages
 #   phase 1 scroll newer -> extract 2: same fresh (no new -> stop)
-#   phase 2 init -> extract 3: same fresh
-#   phase 2 scroll older -> extract 4: same fresh (no new -> stop)
+#   phase 2 starts from the current batch
+#   phase 2 scroll older -> extract 3: same fresh (no new -> stop)
 extracts = [
     _msg_json([
         {"messageId": "a", "text": "old1", "publishedAt": old_iso, "url": "", "links": []},
@@ -419,12 +1111,20 @@ check("scroll sorted old first", res2[0]["messageId"], "a")
 check("scroll sorted recent last", res2[-1]["messageId"], "d")
 check("scroll phase1+phase2 did scroll", fake2.scroll_count > 0, True)
 
+fake2_log = _FakeMCP(extracts)
+stderr_buf = io.StringIO()
+with contextlib.redirect_stderr(stderr_buf):
+    _asyncio.run(ba.collect_with_scroll(fake2_log, "https://web.telegram.org/k/#@t", 24))
+scroll_log = stderr_buf.getvalue()
+check("scroll log initial count", "scroll initial: batch=2" in scroll_log, True)
+check("scroll log new count", "scroll phase1 iter=0: batch=2" in scroll_log and "new=2" in scroll_log, True)
+check("scroll log accumulated total", "total=4" in scroll_log, True)
+
 # Сценарий 3: приземлились на свежих сообщениях (хвост), старых нет.
 #   extract 0 (initial): 2 fresh
 #   phase 1: newest_ts fresh -> break immediately
-#   phase 2 init -> extract 1: same fresh
 #   phase 2: oldest_ts fresh (not < cutoff), scroll older
-#   phase 2 -> extract 2: same fresh (no new -> stop)
+#   phase 2 -> extract 1: same fresh (no new -> stop)
 extracts3 = [
     _msg_json([
         {"messageId": "c", "text": "new1", "publishedAt": fresh_iso, "url": "", "links": []},
@@ -440,9 +1140,47 @@ extracts3 = [
     ]),
 ]
 fake3 = _FakeMCP(extracts3)
-res3 = _asyncio.run(ba.collect_with_scroll(fake3, "https://web.telegram.org/k/#@t", 24))
+res3 = _asyncio.run(ba.collect_with_scroll(
+    fake3, "https://web.telegram.org/k/#@t", 24, tail_tolerance_s=7200, wait_ms=0
+))
 check("scroll at tail returns 2", len(res3), 2)
 check("scroll at tail sorted", res3[0]["messageId"], "c")
+check("scroll at tail retries stale older edge", fake3.scroll_count >= 2, True)
+
+# Сценарий 3a: первая прокрутка к старым не даёт новых DOM-сообщений,
+# следующая прокрутка догружает более раннее сообщение в окне since_hours.
+extracts3a = [
+    _msg_json([
+        {"messageId": "c", "text": "new1", "publishedAt": fresh_iso, "url": "", "links": []},
+        {"messageId": "d", "text": "new2", "publishedAt": fresh_iso, "url": "", "links": []},
+    ]),
+    _msg_json([
+        {"messageId": "c", "text": "new1", "publishedAt": fresh_iso, "url": "", "links": []},
+        {"messageId": "d", "text": "new2", "publishedAt": fresh_iso, "url": "", "links": []},
+    ]),
+    _msg_json([
+        {"messageId": "b", "text": "older", "publishedAt": _iso(-2), "url": "", "links": []},
+        {"messageId": "c", "text": "new1", "publishedAt": fresh_iso, "url": "", "links": []},
+    ]),
+]
+fake3a = _FakeMCP(extracts3a)
+res3a = _asyncio.run(ba.collect_with_scroll(
+    fake3a, "https://web.telegram.org/k/#@JobBroadcast", 24,
+    tail_tolerance_s=7200, wait_ms=0, max_iter=6,
+))
+check("scroll phase2 ignores first no-new scroll", any(m["messageId"] == "b" for m in res3a), True)
+check("scroll phase2 repeated older scroll", fake3a.scroll_count >= 2, True)
+
+# Сценарий 3b: редкий канал уже внизу, но последние сообщения старые.
+fake3b = _FakeMCP([
+    _msg_json([
+        {"messageId": "a", "text": "old1", "publishedAt": old_iso, "url": "", "links": []},
+        {"messageId": "b", "text": "old2", "publishedAt": old_iso, "url": "", "links": []},
+    ]),
+], at_bottom=True)
+res3b = _asyncio.run(ba.collect_with_scroll(fake3b, "https://web.telegram.org/k/#@t", 24))
+check("scroll old at bottom returns messages", len(res3b), 2)
+check("scroll old at bottom skips phase1 scroll", fake3b.scroll_count, 0)
 
 # Сценарий 4: пустой канал (нет сообщений).
 fake4 = _FakeMCP([_msg_json([])])
@@ -474,7 +1212,9 @@ class _FakeMCPHeal:
         if tool != "browser_evaluate":
             return ""
         fn = args.get("function", "")
-        if "scrollTop" in fn:
+        if "atBottom" in fn and "clientHeight" in fn and "scrollHeight" in fn:
+            return json.dumps({"found": False, "atBottom": False})
+        if "el.scrollTop =" in fn:
             self.scroll_count += 1
             return "ok"
         self.extract_count += 1
@@ -511,7 +1251,9 @@ class _FakeMCPHealFail:
         if tool != "browser_evaluate":
             return ""
         fn = args.get("function", "")
-        if "scrollTop" in fn:
+        if "atBottom" in fn and "clientHeight" in fn and "scrollHeight" in fn:
+            return json.dumps({"found": False, "atBottom": False})
+        if "el.scrollTop =" in fn:
             self.scroll_count += 1
             return "ok"
         self.extract_count += 1
@@ -531,4 +1273,441 @@ res7 = _asyncio.run(ba.collect_with_scroll(
 check("heal failed: bounded scroll", fake7.scroll_count < 10, True)
 check("heal failed: still returns messages", len(res7) > 0, True)
 
+# Сценарий 8: кэшированный extract_js без timestamps — heal вызывается.
+class _FakeMCPCached:
+    def __init__(self):
+        self.scroll_count = 0
+        self.heal_called = False
+
+    async def call(self, tool, args, timeout=None):
+        if tool != "browser_evaluate":
+            return ""
+        fn = args.get("function", "")
+        if "atBottom" in fn and "clientHeight" in fn and "scrollHeight" in fn:
+            return json.dumps({"found": False, "atBottom": False})
+        if "el.scrollTop =" in fn:
+            self.scroll_count += 1
+            return "ok"
+        return _msg_json([
+            {"messageId": "a", "text": "no-ts", "publishedAt": "", "url": "", "links": []},
+        ])
+
+fake8 = _FakeMCPCached()
+async def _heal_on_stale_cache(mcp):
+    fake8.heal_called = True
+    return "() => healed"
+
+res8 = _asyncio.run(ba.collect_with_scroll(
+    fake8, "https://web.telegram.org/k/#@t", 24,
+    extract_js="() => 'cached-extract'",
+    heal_callback=_heal_on_stale_cache,
+))
+check("cached extract no-ts invokes heal", fake8.heal_called, True)
+
+# Сценарий 8b: кэшированный extract_js с timestamps — heal не вызывается.
+class _FakeMCPCachedWithTs:
+    def __init__(self):
+        self.heal_called = False
+
+    async def call(self, tool, args, timeout=None):
+        if tool != "browser_evaluate":
+            return ""
+        fn = args.get("function", "")
+        if "atBottom" in fn and "clientHeight" in fn and "scrollHeight" in fn:
+            return json.dumps({"found": False, "atBottom": False})
+        if "el.scrollTop =" in fn:
+            return "ok"
+        return _msg_json([
+            {"messageId": "a", "text": "fresh", "publishedAt": fresh_iso, "url": "", "links": []},
+        ])
+
+fake8b = _FakeMCPCachedWithTs()
+async def _heal_must_not_run(mcp):
+    fake8b.heal_called = True
+    return "healed"
+
+res8b = _asyncio.run(ba.collect_with_scroll(
+    fake8b, "https://web.telegram.org/k/#@t", 24,
+    extract_js="() => 'cached-extract'",
+    heal_callback=_heal_must_not_run,
+))
+check("cached extract with ts skips heal", fake8b.heal_called, False)
+check("cached extract with ts returns messages", len(res8b), 1)
+
+# Сценарий 9: max_messages обрезает результат до N самых новых.
+_many_msgs = [
+    {"messageId": str(i), "text": f"m{i}", "publishedAt": fresh_iso, "url": "", "links": []}
+    for i in range(50)
+]
+
+class _FakeMCPMany:
+    def __init__(self):
+        self.scroll_count = 0
+
+    async def call(self, tool, args, timeout=None):
+        if tool != "browser_evaluate":
+            return ""
+        fn = args.get("function", "")
+        if "atBottom" in fn and "clientHeight" in fn and "scrollHeight" in fn:
+            return json.dumps({"found": False, "atBottom": False})
+        if "el.scrollTop =" in fn:
+            self.scroll_count += 1
+            return "ok"
+        return _msg_json(_many_msgs)
+
+res9 = _asyncio.run(ba.collect_with_scroll(
+    _FakeMCPMany(), "https://web.telegram.org/k/#@t", 24, max_messages=10,
+))
+check("messages limit trims to 10", len(res9), 10)
+check("messages limit keeps newest", res9[-1]["messageId"], "49")
+
 print("\n[browser_agent.collect_with_scroll heal] все проверки пройдены")
+
+
+# --- script_tab_ids_to_close (R2) ----------------------------------------- #
+tabs_at_start = [
+    {"tabId": "1", "url": "chrome-extension://abc/connect.html"},
+]
+tabs_after = [
+    {"tabId": "1", "url": "chrome-extension://abc/connect.html"},
+    {"tabId": "2", "url": "chrome-extension://abc/connect.html"},
+]
+check("tab close diff", ba.script_tab_ids_to_close(tabs_at_start, tabs_after), {"2"})
+check("tab close pre-existing connect", ba.script_tab_ids_to_close(
+    tabs_at_start, tabs_at_start,
+), set())
+tabs_user_start = [
+    {"tabId": "5", "url": "https://example.com/"},
+    {"tabId": "6", "url": "https://other.com/"},
+    {"tabId": "7", "url": "chrome-extension://abc/connect.html", "current": True},
+]
+tabs_user_final = [
+    {"tabId": "5", "url": "https://example.com/"},
+    {"tabId": "6", "url": "https://other.com/"},
+    {"tabId": "7", "url": "https://web.telegram.org/k/#@test"},
+]
+check("tab close working connect", ba.script_tab_ids_to_close(
+    tabs_user_start, tabs_user_final, working_tab_id="7",
+), {"7"})
+
+print("\n[browser_agent.script_tab_ids_to_close] все проверки пройдены")
+
+
+# --- async submit timeout (collect pattern) -------------------------------- #
+def _slow_submit():
+    _time.sleep(0.2)
+    return {}
+
+try:
+    _asyncio.run(_asyncio.wait_for(_asyncio.to_thread(_slow_submit), timeout=0.05))
+    check("async submit timeout raises", False, True)
+except _asyncio.TimeoutError:
+    check("async submit timeout raises", True, True)
+
+print("\n[collect.async submit] все проверки пройдены")
+
+
+# --- collect._source_outcome ------------------------------------------------ #
+import collect as collect_mod
+
+check("outcome success", collect_mod._source_outcome({"errors": [], "skipped": ""}), "success")
+check("outcome skipped", collect_mod._source_outcome({"skipped": "all old"}), "skipped")
+check("outcome errored", collect_mod._source_outcome({"errors": ["x"], "skipped": ""}), "errored")
+check(
+    "outcome errors beat skipped",
+    collect_mod._source_outcome({"errors": ["x"], "skipped": "all old"}),
+    "errored",
+)
+check(
+    "zero scrape skip constant",
+    collect_mod.NO_MESSAGES_SKIP,
+    "Нет сообщений на странице",
+)
+check(
+    "zero scrape outcome",
+    collect_mod._source_outcome({"skipped": collect_mod.NO_MESSAGES_SKIP}),
+    "empty",
+)
+
+_select_sample = [
+    "https://web.telegram.org/k/#@JobBroadcast",
+    "https://web.telegram.org/k/#@evacuatejobs",
+]
+check(
+    "select channel by @name",
+    collect_mod.select_channels(_select_sample, "@JobBroadcast"),
+    ["https://web.telegram.org/k/#@JobBroadcast"],
+)
+check(
+    "select channel by bare name",
+    collect_mod.select_channels(_select_sample, "JobBroadcast"),
+    ["https://web.telegram.org/k/#@JobBroadcast"],
+)
+check(
+    "select channel empty keeps all",
+    collect_mod.select_channels(_select_sample, ""),
+    _select_sample,
+)
+try:
+    collect_mod.select_channels(_select_sample, "@missing")
+    check("select missing channel raises", False, True)
+except ValueError as e:
+    check("select missing channel raises", "channels.json" in str(e), True)
+
+print("\n[collect._source_outcome] все проверки пройдены")
+
+
+# --- collect session-check policy + worker queue -------------------------- #
+class _FakeMCPNav:
+    def __init__(self, fail_nav=False):
+        self.fail_nav = fail_nav
+        self.calls = []
+
+    async def call(self, tool, args, timeout=None):
+        self.calls.append((tool, args))
+        if self.fail_nav and tool == "browser_navigate":
+            raise RuntimeError("nav failed")
+        return ""
+
+
+_session_calls = []
+_ready_values = []
+
+async def _fake_ready(mcp):
+    return _ready_values.pop(0) if _ready_values else True
+
+
+async def _fake_session(mcp, tab_hint):
+    _session_calls.append(tab_hint)
+    return True
+
+
+async def _fake_collect(mcp, source_url, since_hours, extract_js=None, heal_callback=None):
+    return []
+
+
+async def _fake_ai_js(mcp, source_url, label):
+    return []
+
+
+_orig_ready = collect_mod.ba.wait_for_channel_ready
+_orig_session = collect_mod.ba.telegram_session_active
+_orig_collect_scroll = collect_mod.ba.collect_with_scroll
+_orig_ai_js = collect_mod._extract_via_ai_js
+try:
+    collect_mod.ba.wait_for_channel_ready = _fake_ready
+    collect_mod.ba.telegram_session_active = _fake_session
+    collect_mod.ba.collect_with_scroll = _fake_collect
+    collect_mod._extract_via_ai_js = _fake_ai_js
+    collect_mod.STATS["per_source"] = {}
+    _session_calls.clear()
+    _ready_values[:] = [True, True, False]
+    _asyncio.run(collect_mod.process_source(_FakeMCPNav(), "https://web.telegram.org/k/#@one", check_session=True))
+    _asyncio.run(collect_mod.process_source(_FakeMCPNav(), "https://web.telegram.org/k/#@two", check_session=False))
+    _asyncio.run(collect_mod.process_source(_FakeMCPNav(), "https://web.telegram.org/k/#@three", check_session=False))
+    nav_result = _asyncio.run(collect_mod.process_source(
+        _FakeMCPNav(fail_nav=True),
+        "https://web.telegram.org/k/#@four",
+        check_session=False,
+    ))
+    check("session first + empty dom only", len(_session_calls), 2)
+    check("navigation error asks next session check", nav_result["session_check_next"], True)
+finally:
+    collect_mod.ba.wait_for_channel_ready = _orig_ready
+    collect_mod.ba.telegram_session_active = _orig_session
+    collect_mod.ba.collect_with_scroll = _orig_collect_scroll
+    collect_mod._extract_via_ai_js = _orig_ai_js
+
+
+def _run_worker_queue_test():
+    async def _run():
+        orig_submit = collect_mod.submit_messages
+        try:
+            def _fake_submit(source, messages, timeout=90):
+                _time.sleep(0.05)
+                return {
+                    "source": source,
+                    "messagesReceived": len(messages),
+                    "filteredByTime": 0,
+                    "filteredByPrefilter": 0,
+                    "modelRequests": 1,
+                    "jobsExtracted": len(messages),
+                    "jobsRejected": 0,
+                    "rowsAdded": len(messages),
+                    "duplicates": 0,
+                    "skipped": "",
+                    "errors": [],
+                }
+
+            collect_mod.submit_messages = _fake_submit
+            collect_mod.STATS["per_source"] = {}
+            queue = _asyncio.Queue()
+            workers = [
+                _asyncio.create_task(collect_mod._openrouter_worker(i, queue))
+                for i in range(2)
+            ]
+            for i in range(3):
+                src = f"https://web.telegram.org/k/#@q{i}"
+                await queue.put((src, [{"messageId": str(i)}], collect_mod._empty_source_stats(src)))
+            await queue.join()
+            for _ in workers:
+                await queue.put(None)
+            await _asyncio.gather(*workers)
+            return collect_mod.STATS["per_source"]
+        finally:
+            collect_mod.submit_messages = orig_submit
+
+    return _asyncio.run(_run())
+
+
+worker_stats = _run_worker_queue_test()
+check("worker queue processed all", len(worker_stats), 3)
+check("worker queue rows added", sum(st["rowsAdded"] for st in worker_stats.values()), 3)
+
+print("\n[collect session policy + worker queue] все проверки пройдены")
+
+
+# --- collector sends unfiltered messages to server ------------------------- #
+csv_col = os.path.join(tmp, "telegram_collector.csv")
+server_mod.CSV_PATH = csv_col
+server_mod.SINCE_HOURS = 24
+try:
+    lib.reset_csv(csv_col)
+    collector_resp = server_mod.process_messages(
+        "https://web.telegram.org/k/#@evacuatejobs",
+        [
+            {"messageId": "1", "text": "Senior Angular Developer and React Developer", "publishedAt": _iso(-1),
+             "url": "", "links": []},
+            {"messageId": "2", "text": "old Angular Developer", "publishedAt": _iso(-100),
+             "url": "", "links": []},
+        ],
+    )
+    check("collector path messagesReceived", collector_resp["messagesReceived"], 2)
+    check("collector path filteredByTime", collector_resp["filteredByTime"], 1)
+    check("collector path not skipped", collector_resp.get("skipped", ""), "")
+finally:
+    server_mod.CSV_PATH = orig_csv
+    server_mod.SINCE_HOURS = orig_since
+    if os.path.exists(csv_col):
+        os.remove(csv_col)
+    if os.path.exists(csv_col + ".lock"):
+        os.remove(csv_col + ".lock")
+
+print("\n[collect.server stats merge] все проверки пройдены")
+
+
+# --- browser_agent.wait_for_channel_ready ---------------------------------- #
+class _FakeMCPReady:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = 0
+
+    async def call(self, tool, args, timeout=None):
+        self.calls += 1
+        if tool != "browser_evaluate":
+            return ""
+        idx = min(self.calls - 1, len(self.responses) - 1)
+        return self.responses[idx]
+
+
+async def _run_ready_early():
+    mcp = _FakeMCPReady([
+        '{"bubbles":0,"scrollable":false}',
+        '{"bubbles":2,"scrollable":true}',
+    ])
+    t0 = _time.monotonic()
+    ok = await ba.wait_for_channel_ready(mcp, timeout_s=2, poll_s=0.05)
+    elapsed = _time.monotonic() - t0
+    return ok, mcp.calls, elapsed
+
+
+ok_early, calls_early, elapsed_early = _asyncio.run(_run_ready_early())
+check("wait_for_channel_ready early", ok_early, True)
+check("wait_for_channel_ready early calls", calls_early, 2)
+check("wait_for_channel_ready early fast", elapsed_early < 1.0, True)
+
+
+async def _run_ready_timeout():
+    mcp = _FakeMCPReady(['{"bubbles":0,"scrollable":false}'])
+    ok = await ba.wait_for_channel_ready(mcp, timeout_s=0.15, poll_s=0.05)
+    return ok, mcp.calls
+
+
+ok_timeout, calls_timeout = _asyncio.run(_run_ready_timeout())
+check("wait_for_channel_ready timeout ok", ok_timeout, False)
+check("wait_for_channel_ready timeout polled", calls_timeout >= 1, True)
+
+print("\n[browser_agent.wait_for_channel_ready] все проверки пройдены")
+
+
+# --- server endpoint passes all messages before time filter --------------- #
+_captured_msg_count = []
+
+def _fake_process_messages(source, messages):
+    _captured_msg_count.append(len(messages))
+    return {
+        "source": source,
+        "messagesReceived": len(messages),
+        "filteredByTime": 0,
+        "jobsExtracted": 0,
+        "rowsAdded": 0,
+        "duplicates": 0,
+        "skipped": "",
+        "errors": [],
+    }
+
+_orig_process = server_mod.process_messages
+server_mod.process_messages = _fake_process_messages
+try:
+    with server_mod.app.test_client() as client:
+        payload = {
+            "source": "https://web.telegram.org/k/#@evacuatejobs",
+            "messages": [
+                {"messageId": str(i), "text": f"m{i}", "publishedAt": fresh_at,
+                 "url": "", "links": []}
+                for i in range(20)
+            ],
+        }
+        resp = client.post("/import-telegram", json=payload)
+        check("endpoint status 200", resp.status_code, 200)
+        check("endpoint passes all messages", _captured_msg_count[-1], 20)
+finally:
+    server_mod.process_messages = _orig_process
+
+print("\n[server] import-telegram message count OK")
+
+
+# --- collect.log append-only (no race with server) ----------------------- #
+race_log = os.path.join(tmp, "race.log")
+_saved_stdout = sys.stdout
+_saved_stderr = sys.stderr
+try:
+    lib.setup_file_logging(race_log)
+    print("parent-before")
+    lib.append_collect_log(race_log, "[server] server-stage")
+    print("parent-after")
+    sys.stdout.flush()
+finally:
+    sys.stdout = _saved_stdout
+    sys.stderr = _saved_stderr
+
+with open(race_log, encoding="utf-8") as f:
+    race_text = f.read()
+check("race server line intact", "[server] server-stage" in race_text, True)
+check("race parent-after intact", "parent-after" in race_text, True)
+check("race no truncated server line", "erver-stage" in race_text and "[server] server-stage" not in race_text, False)
+
+print("\n[collect.log race] все проверки пройдены")
+
+
+# --- collect.py logging --------------------------------------------------- #
+with open(os.path.join(HERE, "collect.py"), encoding="utf-8") as _cf:
+    _collect_src = _cf.read()
+check("no client time filter", "_filter_dated_messages" in _collect_src, False)
+check(
+    "process_source combined count log",
+    "отфильтровано по времени" in _collect_src and "Собрано сообщений" in _collect_src,
+    True,
+)
+
+print("\n[collect.logging] все проверки пройдены")

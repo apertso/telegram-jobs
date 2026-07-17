@@ -91,6 +91,24 @@ def normalize_work_mode(value) -> str:
     return ""
 
 
+def strip_work_mode_from_location(location: str, work_mode: str) -> tuple[str, str]:
+    """Убирает из location значения, которые являются только режимом работы.
+
+    Если location совпадает с work_mode или целиком является известным
+    work-mode токеном, location очищается; work_mode заполняется при необходимости.
+    """
+    loc = _clean(location)
+    wm = normalize_work_mode(work_mode)
+    if not loc:
+        return "", wm
+    loc_key = normalize_hyphens(loc).lower()
+    if wm and loc_key == wm.lower():
+        return "", wm
+    if loc_key in WORK_MODE_MAP:
+        return "", wm or WORK_MODE_MAP[loc_key]
+    return loc, wm
+
+
 # --------------------------------------------------------------------------- #
 # Работа с Telegram-ссылками
 # --------------------------------------------------------------------------- #
@@ -124,6 +142,34 @@ def parse_telegram_source(url: str):
     return (channel, thread)
 
 
+def source_label(url: str) -> str:
+    """Короткая метка источника для логов: @channel или @channel?thread=N."""
+    channel, thread = parse_telegram_source(url)
+    if channel:
+        return "@" + channel + (f"?thread={thread}" if thread else "")
+    return url or "(unknown)"
+
+
+import threading
+
+_collect_log_lock = threading.Lock()
+
+
+def append_collect_log(path: str, message: str) -> None:
+    """Дописывает строку в collect.log (единый путь записи для collect и server)."""
+    if not path or not message:
+        return
+    from datetime import datetime
+
+    try:
+        ts = datetime.now().strftime("%H:%M:%S")
+        with _collect_log_lock:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"{ts} {message}\n")
+    except OSError:
+        pass
+
+
 def to_public_tme(url: str):
     """Преобразует ссылку Telegram Web в публичную t.me-ссылку канала.
 
@@ -136,12 +182,37 @@ def to_public_tme(url: str):
     return f"https://t.me/{channel}"
 
 
-def message_permalink(source_url: str, message_id: str):
-    """Строит пермализацию сообщения: https://t.me/<channel>/<messageId>."""
-    channel, _ = parse_telegram_source(source_url)
-    if not channel or not message_id:
+def normalize_message_id(message_id: str) -> str:
+    """Приводит DOM messageId к публичному id для t.me.
+
+    Telegram Web K иногда отдаёт в data-mid значение > 2**32; для ссылок
+    нужны младшие 32 бита (например 4295072879 -> 105583).
+    """
+    s = str(message_id or "").strip()
+    if not s:
         return ""
-    return f"https://t.me/{channel}/{message_id}"
+    if not s.isdigit():
+        return s
+    n = int(s)
+    if n > 0xFFFFFFFF:
+        n &= 0xFFFFFFFF
+    return str(n)
+
+
+def message_permalink(source_url: str, message_id: str):
+    """Строит пермалинк поста.
+
+    Канал: https://t.me/<channel>/<messageId>
+    Форум-топик: https://t.me/<channel>/<threadId>/<messageId>
+    (см. https://core.telegram.org/api/links#message-links)
+    """
+    channel, thread = parse_telegram_source(source_url)
+    mid = normalize_message_id(message_id)
+    if not channel or not mid:
+        return ""
+    if thread:
+        return f"https://t.me/{channel}/{thread}/{mid}"
+    return f"https://t.me/{channel}/{mid}"
 
 
 # --------------------------------------------------------------------------- #
@@ -237,8 +308,10 @@ def is_direct_link(url: str) -> bool:
 def dedup_key(title, company, location, work_mode, url) -> str:
     """Строит ключ дедупликации.
 
-    Полный ключ:  Title + Company + Location + WorkMode + URL
-    При пустом URL: Title + Company + Location + WorkMode
+    Базовый ключ: Title + Company + Location + WorkMode.
+    Прямая ссылка на вакансию (не Telegram) добавляется в ключ.
+    Telegram-пермалинки и пустой URL в ключ не входят — репосты
+  одной вакансии из разных каналов считаются дубликатами.
 
     Перед сравнением: удаление лишних пробелов, нижний регистр,
     нормализация дефисов, нормализация WorkMode и URL.
@@ -250,7 +323,7 @@ def dedup_key(title, company, location, work_mode, url) -> str:
     url_norm = normalize_url(url).lower()
 
     parts = [title, company, location, work_mode]
-    if url_norm:
+    if url_norm and is_direct_link(url):
         parts.append(url_norm)
     return "||".join(parts)
 
@@ -261,33 +334,33 @@ def dedup_key(title, company, location, work_mode, url) -> str:
 def normalize_job(job: dict) -> dict:
     """Возвращает очищенную копию вакансии с нормализованными полями
     WorkMode и URL. Поля не выдумываются — отсутствующие остаются пустыми."""
+    loc, wm = strip_work_mode_from_location(
+        job.get("location") or job.get("Location") or "",
+        job.get("workMode") or job.get("WorkMode") or "",
+    )
     return {
         "Title": _clean(job.get("title") or job.get("Title") or ""),
         "Company": _clean(job.get("company") or job.get("Company") or ""),
-        "Location": _clean(job.get("location") or job.get("Location") or ""),
-        "WorkMode": normalize_work_mode(job.get("workMode") or job.get("WorkMode") or ""),
+        "Location": loc,
+        "WorkMode": wm,
         "URL": normalize_url(job.get("url") or job.get("URL") or ""),
     }
 
 
-def choose_url(source_url: str, message: dict | None, job_url: str) -> str:
-    """Выбирает итоговый URL по приоритету:
+def resolve_job_url(source_url: str, message: dict | None, model_url: str) -> str:
+    """Итоговый URL для CSV.
 
-    1. Прямая ссылка на вакансию/отклик (http(s), не Telegram).
-    2. Ссылка на Telegram-публикацию (message.url).
-    3. Публичная ссылка на канал (t.me/<channel>).
-    4. Исходная ссылка Telegram Web.
-    5. Пустое значение.
+    1. Прямая ссылка на вакансию/отклик из ответа модели (http(s), не Telegram).
+    2. Иначе — пермалинк поста из message (url или message_permalink).
+    3. Иначе — пустая строка.
     """
-    if is_direct_link(job_url):
-        return normalize_url(job_url)
-    if message and message.get("url"):
-        return normalize_url(message["url"])
-    pub = to_public_tme(source_url)
-    if pub:
-        return normalize_url(pub)
-    if source_url:
-        return normalize_url(source_url)
+    if is_direct_link(model_url):
+        return normalize_url(model_url)
+    if message:
+        url = str(message.get("url") or "").strip()
+        if not url:
+            url = message_permalink(source_url, str(message.get("messageId") or ""))
+        return normalize_url(url) if url else ""
     return ""
 
 
@@ -388,16 +461,28 @@ def reset_csv(path: str) -> None:
     _write_rows(path, [])
 
 
-def add_jobs(path: str, jobs: list[dict]):
-    """Добавляет новые вакансии в CSV с дедупликацией.
+def add_jobs_with_report(path: str, jobs: list[dict]):
+    """Добавляет вакансии в CSV и возвращает подробный dedup-отчёт.
 
-    Возвращает (rows_added, duplicates). Существующие строки и заголовок
-    сохраняются. Файл создаётся при первом запуске. Запись атомарна:
-    пишется временный файл в той же директории и заменяется через os.replace.
-    Блокировка защищает от одновременных запросов.
+    Возвращает (rows_added, duplicates, reports), где reports сохраняет порядок
+    входных jobs и содержит result: added, duplicate или empty.
     """
-    # Отбрасываем полностью пустые вакансии до блокировки.
-    jobs = [j for j in (jobs or []) if not _is_empty_job(normalize_job(j))]
+    prepared: list[tuple[int, dict, str]] = []
+    reports: list[dict] = []
+    for idx, job in enumerate(jobs or []):
+        norm = normalize_job(job)
+        key = dedup_key(
+            norm["Title"], norm["Company"], norm["Location"], norm["WorkMode"], norm["URL"]
+        )
+        if _is_empty_job(norm):
+            reports.append({
+                "index": idx,
+                "result": "empty",
+                "dedupKey": key,
+                "row": norm,
+            })
+            continue
+        prepared.append((idx, norm, key))
 
     with _FileLock(path):
         rows = read_rows(path)
@@ -407,21 +492,41 @@ def add_jobs(path: str, jobs: list[dict]):
         rows_added = 0
         duplicates = 0
 
-        for job in jobs:
-            norm = normalize_job(job)
-            if _is_empty_job(norm):
-                continue
-            key = dedup_key(
-                norm["Title"], norm["Company"], norm["Location"], norm["WorkMode"], norm["URL"]
-            )
+        for idx, norm, key in prepared:
             if not key or key in existing or key in new_keys:
                 duplicates += 1
+                reports.append({
+                    "index": idx,
+                    "result": "duplicate",
+                    "dedupKey": key,
+                    "row": norm,
+                })
                 continue
             new_keys.add(key)
             rows.append(norm)
             rows_added += 1
+            reports.append({
+                "index": idx,
+                "result": "added",
+                "dedupKey": key,
+                "row": norm,
+            })
 
         _write_rows(path, rows)
+
+    reports.sort(key=lambda item: item["index"])
+    return rows_added, duplicates, reports
+
+
+def add_jobs(path: str, jobs: list[dict]):
+    """Добавляет новые вакансии в CSV с дедупликацией.
+
+    Возвращает (rows_added, duplicates). Существующие строки и заголовок
+    сохраняются. Файл создаётся при первом запуске. Запись атомарна:
+    пишется временный файл в той же директории и заменяется через os.replace.
+    Блокировка защищает от одновременных запросов.
+    """
+    rows_added, duplicates, _reports = add_jobs_with_report(path, jobs)
     return rows_added, duplicates
 
 
@@ -471,30 +576,24 @@ def setup_console() -> None:
                 pass
 
 
-def setup_file_logging(path: str = "collect.log") -> object:
-    """Дублирует stdout/stderr в файл лога через logging.
+def setup_file_logging(path: str = "collect.log") -> str:
+    """Дублирует stdout/stderr в файл лога через append_collect_log.
 
-    Файл обрезается при каждом запуске (режим 'w'). Не подменяет sys.stdout/
-    sys.stderr напрямую (это ломает subprocess.Popen, которому нужен fileno()),
-    а использует logging StreamHandler с файловым потоком.
+    Файл обрезается один раз при старте сессии. Все последующие записи
+    (collect и server) идут только через append — без FileHandler, чтобы
+    не затирать строки дочернего процесса.
     """
-    import logging
     import sys
 
-    logger = logging.getLogger("collect")
-    logger.setLevel(logging.DEBUG)
-    logger.handlers.clear()
-
-    fh = logging.FileHandler(path, mode="w", encoding="utf-8")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%H:%M:%S"))
-    logger.addHandler(fh)
+    try:
+        open(path, "w", encoding="utf-8").close()
+    except OSError:
+        pass
 
     class _StdProxy:
         """Прокси для stdout/stderr: пишет в оригинальный поток и в лог-файл."""
-        def __init__(self, original, level):
+        def __init__(self, original):
             self._orig = original
-            self._level = level
             self._buf = ""
 
         def write(self, data: str) -> int:
@@ -506,7 +605,7 @@ def setup_file_logging(path: str = "collect.log") -> object:
             while "\n" in self._buf:
                 line, self._buf = self._buf.split("\n", 1)
                 if line.strip():
-                    logger.log(self._level, line.rstrip())
+                    append_collect_log(path, line.rstrip())
             return len(data)
 
         def flush(self) -> None:
@@ -515,7 +614,7 @@ def setup_file_logging(path: str = "collect.log") -> object:
             except Exception:
                 pass
             if self._buf.strip():
-                logger.log(self._level, self._buf.rstrip())
+                append_collect_log(path, self._buf.rstrip())
                 self._buf = ""
 
         def reconfigure(self, **kwargs) -> None:
@@ -532,6 +631,6 @@ def setup_file_logging(path: str = "collect.log") -> object:
         def fileno(self):
             return self._orig.fileno()
 
-    sys.stdout = _StdProxy(sys.stdout, logging.INFO)
-    sys.stderr = _StdProxy(sys.stderr, logging.WARNING)
-    return fh
+    sys.stdout = _StdProxy(sys.stdout)
+    sys.stderr = _StdProxy(sys.stderr)
+    return path

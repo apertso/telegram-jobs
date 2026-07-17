@@ -48,12 +48,15 @@ FORBIDDEN_MCP_TOOLS = {"browser_run_code_unsafe"}
 HIGHLIGHT_BEFORE_CLICK = (os.getenv("HIGHLIGHT_BEFORE_CLICK", "false").lower()
                           not in ("0", "false", "no", "off"))
 MAX_MESSAGE_TEXT = 8000
-MAX_MESSAGES = int(os.getenv("TELEGRAM_MESSAGES_LIMIT", "30"))
+# Опциональный лимит (0 = без ограничения). Не применяется до фильтра времени на server.
+MAX_MESSAGES = int(os.getenv("TELEGRAM_MESSAGES_LIMIT", "0"))
 
 # Параметры scroll-collect цикла (R4).
 SCROLL_MAX_ITER = int(os.getenv("SCROLL_MAX_ITER", "15"))
 SCROLL_WAIT_MS = int(os.getenv("SCROLL_WAIT_MS", "800"))
 SCROLL_TAIL_TOLERANCE_S = int(os.getenv("SCROLL_TAIL_TOLERANCE_S", "60"))
+SCROLL_STALL_LIMIT = max(1, int(os.getenv("SCROLL_STALL_LIMIT", "3")))
+NAV_READY_TIMEOUT_S = float(os.getenv("NAV_READY_TIMEOUT_S", "5"))
 
 # Read-only JS для извлечения сообщений из Telegram Web (web.telegram.org/k).
 # НЕ изменяет DOM, storage, cookies или сеть. Только чтение видимых сообщений.
@@ -65,6 +68,21 @@ EXTRACT_MESSAGES_JS = """() => {
     return d.getUTCFullYear() + '-' + pad(d.getUTCMonth()+1) + '-' + pad(d.getUTCDate())
       + 'T' + pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ':' + pad(d.getUTCSeconds()) + 'Z';
   }
+  function normalizeMid(mid) {
+    const n = parseInt(mid, 10);
+    if (isNaN(n)) return mid || '';
+    if (n > 0xFFFFFFFF) return String(n >>> 0);
+    return String(n);
+  }
+  function readTimestamp(el) {
+    const direct = el.getAttribute('data-timestamp');
+    if (direct) return direct;
+    const nested = el.querySelector('[data-timestamp]');
+    if (nested) return nested.getAttribute('data-timestamp') || '';
+    const timeEl = el.querySelector('.time, .time-inner, [data-time]');
+    if (timeEl) return timeEl.getAttribute('data-time') || timeEl.getAttribute('datetime') || '';
+    return '';
+  }
   // Ищем элементы с data-mid (маркер сообщения в Telegram Web K).
   const nodes = Array.from(document.querySelectorAll('[data-mid]'));
   let items = [];
@@ -72,8 +90,7 @@ EXTRACT_MESSAGES_JS = """() => {
     if (it.classList.contains('service') || it.classList.contains('bubbles-date-group')) continue;
     const mid = it.getAttribute('data-mid');
     if (!mid) continue;
-    const timeEl = it.querySelector('.time, [data-time]');
-    const ts = timeEl ? (timeEl.getAttribute('data-time') || timeEl.getAttribute('datetime') || '') : '';
+    const ts = readTimestamp(it);
     const textEl = it.querySelector('.text') || it.querySelector('.bubble-content') || it;
     const text = (textEl.innerText || textEl.textContent || '').trim();
     if (!text || text.length < 2) continue;
@@ -83,7 +100,7 @@ EXTRACT_MESSAGES_JS = """() => {
     items.push({ mid, ts, text, links });
   }
   return JSON.stringify(items.map(m => ({
-    messageId: m.mid || '',
+    messageId: normalizeMid(m.mid) || '',
     text: m.text,
     publishedAt: toIso(m.ts),
     url: '',
@@ -337,7 +354,7 @@ def _clean_messages(data: dict, source_url: str) -> list[dict]:
     for m in raw:
         if not isinstance(m, dict):
             continue
-        mid = str(m.get("messageId") or "").strip()
+        mid = lib.normalize_message_id(str(m.get("messageId") or "").strip())
         text = (m.get("text") or "").strip()
         if not text:
             continue
@@ -450,6 +467,38 @@ def _scroll_js(direction: str) -> str:
             "if (el) el.scrollTop = 0; }")
 
 
+_SCROLL_STATE_JS = """() => {
+  const candidates = [
+    document.querySelector('.bubbles-scrollable'),
+    document.querySelector('[class*="scroll"]'),
+    document.querySelector('[class*="bubble"]')?.parentElement
+  ].filter(Boolean);
+  const el = candidates.find(node => node.scrollHeight > node.clientHeight) || candidates[0];
+  if (!el) return JSON.stringify({ found: false, atBottom: false });
+  const scrollTop = Number(el.scrollTop || 0);
+  const clientHeight = Number(el.clientHeight || 0);
+  const scrollHeight = Number(el.scrollHeight || 0);
+  const atBottom = scrollTop + clientHeight >= scrollHeight - 10;
+  return JSON.stringify({ found: true, atBottom, scrollTop, clientHeight, scrollHeight });
+}"""
+
+
+def _scroll_at_bottom_from_eval(raw: str) -> bool | None:
+    """Возвращает позицию scroll-контейнера или None, если её не удалось прочитать."""
+    value = _parse_evaluate_value(raw)
+    if not isinstance(value, dict) or not value.get("found"):
+        return None
+    if isinstance(value.get("atBottom"), bool):
+        return bool(value["atBottom"])
+    try:
+        scroll_top = float(value.get("scrollTop"))
+        client_height = float(value.get("clientHeight"))
+        scroll_height = float(value.get("scrollHeight"))
+    except (TypeError, ValueError):
+        return None
+    return scroll_top + client_height >= scroll_height - 10
+
+
 def _merge_by_id(accumulated: dict[str, dict], batch: list[dict]) -> int:
     """Сливает batch в accumulated (по messageId), возвращает кол-во новых."""
     new_count = 0
@@ -482,6 +531,22 @@ def _oldest_ts(batch: list[dict]) -> float | None:
     return best
 
 
+def _format_ts(ts: float | None) -> str:
+    if ts is None:
+        return "none"
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _batch_summary(batch: list[dict]) -> str:
+    ids = [str(m.get("messageId") or "") for m in batch if m.get("messageId")]
+    oldest = _oldest_ts(batch)
+    newest = _newest_ts(batch)
+    id_part = ""
+    if ids:
+        id_part = f", ids={ids[0]}..{ids[-1]}"
+    return f"batch={len(batch)}, ts={_format_ts(oldest)}..{_format_ts(newest)}{id_part}"
+
+
 def _accumulated_oldest_ts(accumulated: dict[str, dict]) -> float | None:
     """Самая старая метка publishedAt во всём накопленном множестве."""
     best: float | None = None
@@ -506,7 +571,7 @@ def _has_timestamps(messages: list[dict]) -> bool:
         if (ts := _parse_iso_ts(m.get("publishedAt", ""))) is not None
         and ten_years_ago < ts <= now + 3600
     )
-    return valid >= len(messages) // 2
+    return valid > 0 and valid >= (len(messages) + 1) // 2
 
 
 async def collect_with_scroll(
@@ -518,6 +583,7 @@ async def collect_with_scroll(
     tail_tolerance_s: int = SCROLL_TAIL_TOLERANCE_S,
     extract_js: str | None = None,
     heal_callback=None,
+    max_messages: int | None = None,
 ) -> list[dict]:
     """Сбор сообщений из Telegram Web с прокруткой в обе стороны (R4).
 
@@ -552,11 +618,20 @@ async def collect_with_scroll(
         await mcp.call("browser_evaluate", {"function": _scroll_js(direction)}, timeout=8)
         await asyncio.sleep(wait_ms / 1000)
 
+    async def _at_bottom() -> bool | None:
+        try:
+            raw = await mcp.call("browser_evaluate", {"function": _SCROLL_STATE_JS}, timeout=8)
+            return _scroll_at_bottom_from_eval(raw)
+        except Exception as e:
+            log(f"scroll state unavailable: {e}")
+            return None
+
     # --- Начальное извлечение и определение направления ---
     batch = await _extract()
     _merge_by_id(accumulated, batch)
+    log(f"scroll initial: {_batch_summary(batch)}, total={len(accumulated)}")
 
-    # --- Auto-healing: если сообщения есть, но метки времени отсутствуют ---
+    # --- Auto-healing: если метки времени отсутствуют (в т.ч. устаревший кэш) ---
     if batch and not _has_timestamps(batch) and heal_callback is not None:
         log("timestamps missing after initial extract, invoking heal_callback")
         healed_js = await heal_callback(mcp)
@@ -566,33 +641,39 @@ async def collect_with_scroll(
             batch = await _extract()
             accumulated.clear()
             _merge_by_id(accumulated, batch)
+            log(f"scroll after heal: {_batch_summary(batch)}, total={len(accumulated)}")
 
     older_edge, newer_edge = _detect_scroll_direction(batch) if batch else ("top", "bottom")
+    at_bottom = await _at_bottom() if batch else None
 
     # --- Фаза 1: к новым сообщениям (достигаем «живого хвоста») ---
-    no_ts_iter1 = 0
-    for i in range(max_iter):
-        if not batch:
-            break
-        nts = _newest_ts(batch)
-        if nts is not None and (now - nts) <= tail_tolerance_s:
-            log(f"scroll phase1 iter={i}: newest={nts:.0f} within tail tolerance, stop")
-            break
-        if nts is None:
-            no_ts_iter1 += 1
-            if no_ts_iter1 > 3:
-                log(f"scroll phase1 iter={i}: no timestamps after {no_ts_iter1} iterations, stop")
+    if at_bottom is True:
+        log("scroll phase1: already at bottom, skip")
+    else:
+        no_ts_iter1 = 0
+        for i in range(max_iter):
+            if not batch:
                 break
-        await _scroll(newer_edge)
-        batch = await _extract()
-        new_count = _merge_by_id(accumulated, batch)
-        if new_count == 0:
-            log(f"scroll phase1 iter={i}: no new messages, stop")
-            break
+            nts = _newest_ts(batch)
+            if nts is not None and (now - nts) <= tail_tolerance_s:
+                log(f"scroll phase1 iter={i}: newest={nts:.0f} within tail tolerance, stop")
+                break
+            if nts is None:
+                no_ts_iter1 += 1
+                if no_ts_iter1 > 3:
+                    log(f"scroll phase1 iter={i}: no timestamps after {no_ts_iter1} iterations, stop")
+                    break
+            await _scroll(newer_edge)
+            batch = await _extract()
+            new_count = _merge_by_id(accumulated, batch)
+            log(f"scroll phase1 iter={i}: {_batch_summary(batch)}, new={new_count}, total={len(accumulated)}")
+            if new_count == 0:
+                log(f"scroll phase1 iter={i}: no new messages, stop")
+                break
 
     # --- Фаза 2: к старым сообщениям (до cutoff или дна истории) ---
-    batch = await _extract()
-    acc_oldest_prev: float | None = None
+    log(f"scroll phase2 start: {_batch_summary(batch)}, total={len(accumulated)}")
+    stall_iter = 0
     no_ts_iter = 0
     for i in range(max_iter):
         _merge_by_id(accumulated, batch)
@@ -606,12 +687,6 @@ async def collect_with_scroll(
             if acc_oldest < cutoff:
                 log(f"scroll phase2 iter={i}: acc_oldest={acc_oldest:.0f} < cutoff={cutoff:.0f}, stop")
                 break
-            # Progress check: если accumulated oldest не уменьшился после
-            # прокрутки — мы не загружаем ничего старше, стоп.
-            if acc_oldest_prev is not None and acc_oldest >= acc_oldest_prev:
-                log(f"scroll phase2 iter={i}: no progress (oldest={acc_oldest:.0f} >= prev={acc_oldest_prev:.0f}), stop")
-                break
-            acc_oldest_prev = acc_oldest
         else:
             # Нет валидных меток времени — не можем определить возраст.
             # Ограничиваем количество итераций, чтобы не уходить в глубину.
@@ -620,19 +695,109 @@ async def collect_with_scroll(
                 log(f"scroll phase2 iter={i}: no timestamps after {no_ts_iter} iterations, stop")
                 break
 
-        if not batch:
+        if not batch and not accumulated:
             break
         await _scroll(older_edge)
-        prev_size = len(accumulated)
+        prev_oldest = acc_oldest
         batch = await _extract()
-        _merge_by_id(accumulated, batch)
-        if len(accumulated) == prev_size:
-            log(f"scroll phase2 iter={i}: no new messages after scroll, stop")
-            break
+        new_count = _merge_by_id(accumulated, batch)
+        log(f"scroll phase2 iter={i}: {_batch_summary(batch)}, new={new_count}, total={len(accumulated)}")
+        next_oldest = _accumulated_oldest_ts(accumulated)
+        if (
+            prev_oldest is not None
+            and next_oldest is not None
+            and next_oldest < prev_oldest
+        ) or (prev_oldest is None and new_count > 0):
+            stall_iter = 0
+        else:
+            stall_iter += 1
+            if stall_iter >= SCROLL_STALL_LIMIT:
+                log(
+                    f"scroll phase2 iter={i}: no older messages after "
+                    f"{stall_iter} scrolls, stop"
+                )
+                break
 
     merged = list(accumulated.values())
     merged.sort(key=lambda m: (_parse_iso_ts(m.get("publishedAt", "")) or 0))
+    limit = max_messages if max_messages is not None else MAX_MESSAGES
+    if limit and len(merged) > limit:
+        merged = merged[-limit:]
     return merged
+
+
+# --------------------------------------------------------------------------- #
+# Ожидание готовности канала после навигации
+# --------------------------------------------------------------------------- #
+_CHANNEL_READY_JS = """() => {
+  const bubbles = document.querySelectorAll('div.bubble[data-mid]').length;
+  const scrollable = !!document.querySelector('.bubbles-scrollable');
+  return JSON.stringify({ bubbles, scrollable });
+}"""
+
+
+def _parse_evaluate_value(raw: str):
+    """Извлекает JSON-значение из ответа browser_evaluate."""
+    if not raw or not raw.strip():
+        return None
+    text = raw.strip()
+    if "### Result" in text:
+        start = text.index("### Result") + len("### Result")
+        end = text.find("### Ran", start)
+        if end == -1:
+            end = len(text)
+        text = text[start:end].strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text).strip()
+    try:
+        value = json.loads(text)
+        if isinstance(value, str):
+            value = json.loads(value)
+        return value
+    except Exception:
+        for opener, closer in (("{", "}"), ("[", "]")):
+            s = text.find(opener)
+            e = text.rfind(closer)
+            if s != -1 and e > s:
+                try:
+                    return json.loads(text[s : e + 1])
+                except Exception:
+                    continue
+    return None
+
+
+def _channel_ready_from_eval(raw: str) -> bool:
+    value = _parse_evaluate_value(raw)
+    if isinstance(value, dict):
+        return bool(value.get("bubbles")) or bool(value.get("scrollable"))
+    if isinstance(value, (int, float)):
+        return value > 0
+    return False
+
+
+async def wait_for_channel_ready(
+    mcp: MCPSession,
+    timeout_s: float | None = None,
+    poll_s: float = 0.3,
+) -> bool:
+    """Ожидает появления пузырей сообщений или контейнера прокрутки."""
+    if timeout_s is None:
+        timeout_s = NAV_READY_TIMEOUT_S
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            raw = await mcp.call(
+                "browser_evaluate",
+                {"function": _CHANNEL_READY_JS},
+                timeout=5,
+            )
+            if _channel_ready_from_eval(raw):
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(poll_s)
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -721,7 +886,12 @@ def _parse_tabs(result: str) -> list[dict]:
                 url = str(item.get("url") or "")
                 title = str(item.get("title") or "")
                 if tab_id:
-                    tabs.append({"tabId": tab_id, "url": url, "title": title})
+                    tabs.append({
+                        "tabId": tab_id,
+                        "url": url,
+                        "title": title,
+                        "current": bool(item.get("current")),
+                    })
         if tabs:
             return tabs
 
@@ -731,6 +901,7 @@ def _parse_tabs(result: str) -> list[dict]:
         # Пропускаем пустые строки и заголовки разделов.
         if not line or line.startswith("#"):
             continue
+        current = "(current)" in line
         # Убираем начальный дефис/номер.
         line = re.sub(r"^[-*\d]+\s*\.?\s*", "", line)
         # Извлекаем tabId — это первое число до двоеточия.
@@ -753,9 +924,53 @@ def _parse_tabs(result: str) -> list[dict]:
             m_url2 = re.search(r'(https?://\S+)', line)
             if m_url2:
                 url = m_url2.group(1)
-        tabs.append({"tabId": tab_id, "url": url, "title": title})
+        tabs.append({"tabId": tab_id, "url": url, "title": title, "current": current})
 
     return tabs
+
+
+def _is_connect_url(url: str) -> bool:
+    return "connect" in (url or "").lower()
+
+
+def current_tab_id(tabs: list[dict]) -> str | None:
+    """Возвращает tabId активной вкладки из результата list_tabs."""
+    for tab in tabs:
+        if tab.get("current") and tab.get("tabId"):
+            return tab["tabId"]
+    return None
+
+
+def user_tab_ids_at_start(tabs_at_start: list[dict]) -> set[str]:
+    """Непользовательские connect-вкладки не считаются защищёнными."""
+    return {
+        t["tabId"] for t in tabs_at_start
+        if t.get("tabId") and not _is_connect_url(t.get("url", ""))
+    }
+
+
+def script_tab_ids_to_close(
+    tabs_at_start: list[dict],
+    tabs_final: list[dict],
+    *,
+    working_tab_id: str | None = None,
+) -> set[str]:
+    """Возвращает tabId вкладок, открытых этой MCPSession (R2).
+
+    Закрываем вкладки, появившиеся после старта MCP, и рабочую вкладку
+    (connect → telegram), если она не была пользовательской на момент старта.
+    Пользовательские вкладки (не connect) и pre-existing connect без навигации
+    не закрываются.
+    """
+    user_ids = user_tab_ids_at_start(tabs_at_start)
+    start_ids = {t["tabId"] for t in tabs_at_start if t.get("tabId")}
+    final_ids = {t["tabId"] for t in tabs_final if t.get("tabId")}
+    to_close = final_ids - start_ids
+
+    if working_tab_id and working_tab_id not in user_ids:
+        to_close.add(working_tab_id)
+
+    return {tab_id for tab_id in to_close if tab_id not in user_ids}
 
 
 async def list_tabs(mcp: "MCPSession") -> list[dict]:

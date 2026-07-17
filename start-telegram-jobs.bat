@@ -65,14 +65,14 @@ if errorlevel 1 (
 )
 
 echo [@] Запуск Telegram Jobs Collector...
-python collect.py
+python collect.py %*
 set RC=%errorlevel%
 
 if "%RC%"=="130" (
   echo [+] Завершено по Ctrl+C. Дочерние процессы остановлены, Chrome не закрыт.
 ) else if not "%RC%"=="0" (
   echo [!] collect.py завершился с кодом %RC%.
+  pause
 )
 
-pause
 exit /b %RC%

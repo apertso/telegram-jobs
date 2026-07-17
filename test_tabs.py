@@ -57,6 +57,13 @@ async def run_tests():
     # 3. Запоминаем вкладки до создания новой.
     initial_ids = {t["tabId"] for t in tabs}
 
+    # 3b. Pre-existing connect не должен попасть в список на закрытие.
+    connect_pre = next(t for t in tabs if "connect" in t.get("url", "").lower())
+    close_set = ba.script_tab_ids_to_close(tabs, tabs)
+    results.append(check("cleanup: pre-existing connect not closed",
+                         connect_pre["tabId"] not in close_set,
+                         connect_pre["tabId"] in close_set, False))
+
     # 4. Создаём новую вкладку через browser_navigate.
     #    MCP открывает URL в текущей вкладке, поэтому сначала переключим на новую.
     #    Используем browser_tabs с action=new для создания вкладки.
