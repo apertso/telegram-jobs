@@ -7,11 +7,13 @@
 from __future__ import annotations
 
 import csv
+import os
 import re
 from urllib.parse import urlsplit
 
 # Порядок колонок CSV (заголовок).
 CSV_HEADER = ["Title", "Company", "Location", "WorkMode", "URL"]
+DEFAULT_OPENROUTER_MODEL = "deepseek/deepseek-v4-flash"
 
 # Известные tracking-параметры, удаляемые из URL.
 TRACKING_PARAMS = {
@@ -59,6 +61,11 @@ def _clean(value) -> str:
     if value is None:
         return ""
     return re.sub(r"\s+", " ", str(value).strip())
+
+
+def get_openrouter_model() -> str:
+    """Return the configured OpenRouter model or the project default."""
+    return (os.getenv("OPENROUTER_MODEL") or DEFAULT_OPENROUTER_MODEL).strip()
 
 
 def _csv_safe(value) -> str:
@@ -382,7 +389,6 @@ def resolve_job_url(source_url: str, message: dict | None, model_url: str) -> st
 # --------------------------------------------------------------------------- #
 # Работа с CSV
 # --------------------------------------------------------------------------- #
-import os
 import tempfile
 
 try:

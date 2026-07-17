@@ -48,7 +48,7 @@ LOG_PATH = str(HERE / "collect.log")
 lib.setup_file_logging(LOG_PATH)
 CSV_PATH = os.getenv("TELEGRAM_CSV", str(HERE / "telegram.csv"))
 OPENROUTER_API_KEY = (os.getenv("OPENROUTER_API_KEY") or "").strip()
-OPENROUTER_MODEL = (os.getenv("OPENROUTER_MODEL") or "tencent/hy3:free").strip()
+OPENROUTER_MODEL = lib.get_openrouter_model()
 PORT = int(os.getenv("PORT", "3000"))
 SINCE_HOURS = int(os.getenv("TELEGRAM_SINCE_HOURS", "24"))
 CHANNELS_FILE = HERE / "channels.json"

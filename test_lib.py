@@ -35,6 +35,23 @@ def read_jsonl(path):
         return [json.loads(line) for line in f if line.strip()]
 
 
+_original_model_env = os.environ.get("OPENROUTER_MODEL")
+try:
+    os.environ["OPENROUTER_MODEL"] = ""
+    check(
+        "default OpenRouter model",
+        lib.get_openrouter_model(),
+        "deepseek/deepseek-v4-flash",
+    )
+    os.environ["OPENROUTER_MODEL"] = "custom/model"
+    check("OpenRouter model override", lib.get_openrouter_model(), "custom/model")
+finally:
+    if _original_model_env is None:
+        os.environ.pop("OPENROUTER_MODEL", None)
+    else:
+        os.environ["OPENROUTER_MODEL"] = _original_model_env
+
+
 # --- normalize_work_mode -------------------------------------------------- #
 check("wm remote", lib.normalize_work_mode("remote"), "Remote")
 check("wm remotely", lib.normalize_work_mode("Remotely"), "Remote")
