@@ -11,3 +11,4 @@ project_code.txt
 collect.log
 telegram_extract_cache.js
 diagnostics/
+channels.json
