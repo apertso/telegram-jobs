@@ -13,7 +13,6 @@
 """
 
 import asyncio
-import os
 import sys
 from pathlib import Path
 
@@ -39,8 +38,7 @@ def check(name, cond, got="", expected=""):
 
 
 async def run_tests():
-    pkg = os.getenv("PLAYWRIGHT_MCP_PACKAGE") or "@playwright/mcp"
-    m = ba.MCPSession(pkg, HERE / "playwright-mcp.json")
+    m = ba.MCPSession(HERE / "playwright-mcp.json")
     await m.start()
 
     results = []

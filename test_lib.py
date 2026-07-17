@@ -3,6 +3,7 @@
 import importlib.util
 import contextlib
 import io
+import inspect
 import json
 import os
 import re
@@ -71,7 +72,13 @@ check("url strip trailing slash", lib.normalize_url("https://t.me/evacuatejobs/"
 check("url keep thread (fragment)", lib.normalize_url("https://web.telegram.org/k/#@cyprusithr?thread=46685"), "https://web.telegram.org/k#@cyprusithr?thread=46685")
 check("url strip fbclid/gclid", lib.normalize_url("https://x.com/a?fbclid=1&gclid=2&keep=3"), "https://x.com/a?keep=3")
 check("url lowercase host", lib.normalize_url("https://EXAMPLE.com/A"), "https://example.com/A")
-check("url non-http kept", lib.normalize_url("mailto:a@b.com"), "mailto:a@b.com")
+check(
+    "url non-http kept",
+    lib.normalize_url("mailto:user" + "@example.test"),
+    "mailto:user" + "@example.test",
+)
+credential_url = "https://user" + ":pass" + "@example.test/job"
+check("url credentials rejected", lib.normalize_url(credential_url), "")
 
 # --- dedup_key ------------------------------------------------------------ #
 k1 = lib.dedup_key("Senior Dev", "HOS247", "Warsaw, Poland", "Remote", "https://x.com/1")
@@ -188,11 +195,72 @@ check("reset: header preserved", header, "Title,Company,Location,WorkMode,URL")
 added3, dups3 = lib.add_jobs(csv_reset, jobs)
 check("reset: add after reset works", added3, 2)
 
+csv_formula = os.path.join(tmp, "formula.csv")
+lib.reset_csv(csv_formula)
+lib.add_jobs(csv_formula, [{
+    "title": "=HYPERLINK(\"https://example.test\",\"click\")",
+    "company": "+cmd|' /C calc'!A0",
+    "location": "@SUM(1+1)",
+    "workMode": "Remote",
+    "url": "https://example.test/job",
+}])
+formula_row = lib.read_rows(csv_formula)[0]
+check("csv formula title escaped", formula_row["Title"].startswith("'="), True)
+check("csv formula company escaped", formula_row["Company"].startswith("'+"), True)
+check("csv formula location escaped", formula_row["Location"].startswith("'@"), True)
+
 print("\n[lib] все проверки пройдены")
 
 
 # --- _parse_tabs (browser_agent) ----------------------------------------- #
 import browser_agent as ba
+
+_mcp_env_keys = ["OPENROUTER_API_KEY", "UNRELATED_PASSWORD", "PLAYWRIGHT_MCP_EXTENSION_TOKEN"]
+_mcp_env_orig = {key: os.environ.get(key) for key in _mcp_env_keys}
+try:
+    os.environ["OPENROUTER_API_KEY"] = "test-openrouter-secret"
+    os.environ["UNRELATED_PASSWORD"] = "test-password-secret"
+    os.environ["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] = "test-extension-token"
+    child_env = ba._mcp_subprocess_env()
+    check("mcp env excludes OpenRouter key", "OPENROUTER_API_KEY" in child_env, False)
+    check("mcp env excludes unrelated secret", "UNRELATED_PASSWORD" in child_env, False)
+    check("mcp env keeps extension token", child_env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"], "test-extension-token")
+finally:
+    for key, value in _mcp_env_orig.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+check(
+    "mcp allowlist is minimal",
+    ba.ALLOWED_MCP_TOOLS,
+    {"browser_tabs", "browser_navigate", "browser_snapshot", "browser_evaluate"},
+)
+check("locked MCP CLI is installed", ba.MCP_CLI.is_file(), True)
+check(
+    "scroll collector accepts no generated JS",
+    {"extract_js", "heal_callback"}.isdisjoint(inspect.signature(ba.collect_with_scroll).parameters),
+    True,
+)
+
+
+class _SnapshotMCP:
+    async def call(self, name, arguments, timeout=30):
+        return "private-message-that-must-not-be-logged"
+
+
+_snapshot_stderr = io.StringIO()
+with contextlib.redirect_stderr(_snapshot_stderr):
+    _snapshot_active = __import__("asyncio").run(
+        ba.telegram_session_active(_SnapshotMCP())
+    )
+check("unknown snapshot is inactive", _snapshot_active, False)
+check(
+    "unknown snapshot content is not logged",
+    "private-message-that-must-not-be-logged" in _snapshot_stderr.getvalue(),
+    False,
+)
 
 # JSON-формат
 json_result = '{"tabs": [{"tabId": "1", "url": "chrome-extension://abc/connect.html", "title": "Connect"}, {"tabId": "2", "url": "https://web.telegram.org/k/", "title": "Telegram"}]}'
@@ -242,6 +310,7 @@ def fake_call(model, user_prompt):
         ]
     })
 
+_real_call_openrouter = server_mod._call_openrouter
 server_mod._call_openrouter = fake_call
 
 csv2 = os.path.join(tmp, "telegram2.csv")
@@ -722,6 +791,37 @@ check("parse_jobs keeps workMode", parsed_loc[0].workMode, "Remote")
 print("\n[server._parse_jobs] все проверки пройдены")
 
 
+# --- OpenRouter request timeout ------------------------------------------- #
+class _FakeCompletionResponse:
+    choices = [type("Choice", (), {"message": type("Message", (), {"content": '{"jobs": []}'})()})()]
+
+
+class _FakeCompletions:
+    def __init__(self):
+        self.kwargs = None
+
+    def create(self, **kwargs):
+        self.kwargs = kwargs
+        return _FakeCompletionResponse()
+
+
+class _FakeOpenRouterClient:
+    def __init__(self):
+        self.chat = type("Chat", (), {"completions": _FakeCompletions()})()
+
+
+_orig_client = server_mod._client
+try:
+    _timeout_client = _FakeOpenRouterClient()
+    server_mod._client = _timeout_client
+    _real_call_openrouter("test-model", "test prompt")
+    check("OpenRouter request timeout", _timeout_client.chat.completions.kwargs["timeout"], 25)
+finally:
+    server_mod._client = _orig_client
+
+print("\n[server OpenRouter timeout] проверка пройдена")
+
+
 # --- server chunking + strict validation ---------------------------------- #
 chunk_messages = [
     _Msg(messageId=str(i), text=f"Senior Angular Developer {i}", publishedAt=_iso(-1))
@@ -849,7 +949,7 @@ try:
     diagnostics.write_log("messages", {"source": "x", "stage": "test"})
     check("diagnostics disabled no file", os.path.exists(os.path.join(disabled_dir, "messages.jsonl")), False)
 
-    secret_value = "sk-or-v1-testsecretvalue123456"
+    secret_value = "test-secret-value-123456"
     os.environ["OPENROUTER_API_KEY"] = secret_value
     sanitized = diagnostics.sanitize({
         "api_key": secret_value,
@@ -950,12 +1050,7 @@ try:
 
     with open(os.path.join(HERE, ".gitignore"), encoding="utf-8") as f:
         gitignore_text = f.read()
-    with open(os.path.join(HERE, ".env.example"), encoding="utf-8") as f:
-        env_example_text = f.read()
     check("gitignore diagnostics dir", "diagnostics/" in gitignore_text, True)
-    check("env diagnostics enabled", "AI_DIAGNOSTICS_ENABLED=false" in env_example_text, True)
-    check("env diagnostics dir removed", "AI_DIAGNOSTICS_DIR" in env_example_text, False)
-    check("env diagnostics clean removed", "AI_DIAGNOSTICS_CLEAN_ON_START" in env_example_text, False)
 finally:
     diagnostics.DIAGNOSTICS_DIR = _orig_diag_dir
     server_mod._call_openrouter = _orig_diag_call
@@ -992,16 +1087,6 @@ check("dir new-first -> bottom is older", ba._detect_scroll_direction(new_first)
 
 check("dir single -> default", ba._detect_scroll_direction([{"publishedAt": fresh_iso}]), ("top", "bottom"))
 check("dir no-ts -> default", ba._detect_scroll_direction([{"publishedAt": ""}, {"publishedAt": ""}]), ("top", "bottom"))
-
-# _has_timestamps
-check("has_timestamps single no-ts", ba._has_timestamps([{"publishedAt": ""}]), False)
-check("has_timestamps single fresh", ba._has_timestamps([{"publishedAt": fresh_iso}]), True)
-check("has_timestamps majority ok", ba._has_timestamps([
-    {"publishedAt": fresh_iso}, {"publishedAt": ""},
-]), True)
-check("has_timestamps minority fails", ba._has_timestamps([
-    {"publishedAt": fresh_iso}, {"publishedAt": ""}, {"publishedAt": ""},
-]), False)
 
 # _merge_by_id
 acc: dict = {}
@@ -1199,141 +1284,6 @@ res5 = _asyncio.run(ba.collect_with_scroll(fake5, "https://web.telegram.org/k/#@
 check("scroll no-ts did not exhaust max_iter", fake5.scroll_count < 10, True)
 check("scroll no-ts bounded message count", len(res5) <= 10, True)
 
-# Сценарий 6: timestamps отсутствуют в первом extract, heal_callback
-# возвращает новый JS, второй extract (с healed JS) возвращает timestamps.
-# _FakeMCP возвращает разные результаты в зависимости от того, какой JS
-# выполняется: если содержит "healed" — с timestamps, иначе — без.
-class _FakeMCPHeal:
-    def __init__(self):
-        self.scroll_count = 0
-        self.extract_count = 0
-
-    async def call(self, tool, args, timeout=None):
-        if tool != "browser_evaluate":
-            return ""
-        fn = args.get("function", "")
-        if "atBottom" in fn and "clientHeight" in fn and "scrollHeight" in fn:
-            return json.dumps({"found": False, "atBottom": False})
-        if "el.scrollTop =" in fn:
-            self.scroll_count += 1
-            return "ok"
-        self.extract_count += 1
-        if "healed" in fn:
-            return _msg_json([
-                {"messageId": "c", "text": "new1", "publishedAt": fresh_iso, "url": "", "links": []},
-                {"messageId": "d", "text": "new2", "publishedAt": fresh_iso, "url": "", "links": []},
-            ])
-        return _msg_json([
-            {"messageId": "c", "text": "new1", "publishedAt": "", "url": "", "links": []},
-            {"messageId": "d", "text": "new2", "publishedAt": "", "url": "", "links": []},
-        ])
-
-
-async def _heal_cb_ok(mcp):
-    return "() => { return JSON.stringify([{messageId:'c',text:'new1',publishedAt:'" + fresh_iso + "',url:'',links:[]}]); } // healed"
-
-
-fake6 = _FakeMCPHeal()
-res6 = _asyncio.run(ba.collect_with_scroll(
-    fake6, "https://web.telegram.org/k/#@t", 24, heal_callback=_heal_cb_ok
-))
-check("heal triggered: messages have timestamps", ba._has_timestamps(res6), True)
-check("heal triggered: returns 2 messages", len(res6), 2)
-check("heal triggered: extract called >= 2 (initial + post-heal)", fake6.extract_count >= 2, True)
-
-# Сценарий 7: heal_callback возвращает "" (AI не смог) — bounded scroll.
-class _FakeMCPHealFail:
-    def __init__(self):
-        self.scroll_count = 0
-        self.extract_count = 0
-
-    async def call(self, tool, args, timeout=None):
-        if tool != "browser_evaluate":
-            return ""
-        fn = args.get("function", "")
-        if "atBottom" in fn and "clientHeight" in fn and "scrollHeight" in fn:
-            return json.dumps({"found": False, "atBottom": False})
-        if "el.scrollTop =" in fn:
-            self.scroll_count += 1
-            return "ok"
-        self.extract_count += 1
-        return _msg_json([
-            {"messageId": f"m{self.extract_count}", "text": "x", "publishedAt": "", "url": "", "links": []},
-        ])
-
-
-async def _heal_cb_fail(mcp):
-    return ""
-
-
-fake7 = _FakeMCPHealFail()
-res7 = _asyncio.run(ba.collect_with_scroll(
-    fake7, "https://web.telegram.org/k/#@t", 24, heal_callback=_heal_cb_fail
-))
-check("heal failed: bounded scroll", fake7.scroll_count < 10, True)
-check("heal failed: still returns messages", len(res7) > 0, True)
-
-# Сценарий 8: кэшированный extract_js без timestamps — heal вызывается.
-class _FakeMCPCached:
-    def __init__(self):
-        self.scroll_count = 0
-        self.heal_called = False
-
-    async def call(self, tool, args, timeout=None):
-        if tool != "browser_evaluate":
-            return ""
-        fn = args.get("function", "")
-        if "atBottom" in fn and "clientHeight" in fn and "scrollHeight" in fn:
-            return json.dumps({"found": False, "atBottom": False})
-        if "el.scrollTop =" in fn:
-            self.scroll_count += 1
-            return "ok"
-        return _msg_json([
-            {"messageId": "a", "text": "no-ts", "publishedAt": "", "url": "", "links": []},
-        ])
-
-fake8 = _FakeMCPCached()
-async def _heal_on_stale_cache(mcp):
-    fake8.heal_called = True
-    return "() => healed"
-
-res8 = _asyncio.run(ba.collect_with_scroll(
-    fake8, "https://web.telegram.org/k/#@t", 24,
-    extract_js="() => 'cached-extract'",
-    heal_callback=_heal_on_stale_cache,
-))
-check("cached extract no-ts invokes heal", fake8.heal_called, True)
-
-# Сценарий 8b: кэшированный extract_js с timestamps — heal не вызывается.
-class _FakeMCPCachedWithTs:
-    def __init__(self):
-        self.heal_called = False
-
-    async def call(self, tool, args, timeout=None):
-        if tool != "browser_evaluate":
-            return ""
-        fn = args.get("function", "")
-        if "atBottom" in fn and "clientHeight" in fn and "scrollHeight" in fn:
-            return json.dumps({"found": False, "atBottom": False})
-        if "el.scrollTop =" in fn:
-            return "ok"
-        return _msg_json([
-            {"messageId": "a", "text": "fresh", "publishedAt": fresh_iso, "url": "", "links": []},
-        ])
-
-fake8b = _FakeMCPCachedWithTs()
-async def _heal_must_not_run(mcp):
-    fake8b.heal_called = True
-    return "healed"
-
-res8b = _asyncio.run(ba.collect_with_scroll(
-    fake8b, "https://web.telegram.org/k/#@t", 24,
-    extract_js="() => 'cached-extract'",
-    heal_callback=_heal_must_not_run,
-))
-check("cached extract with ts skips heal", fake8b.heal_called, False)
-check("cached extract with ts returns messages", len(res8b), 1)
-
 # Сценарий 9: max_messages обрезает результат до N самых новых.
 _many_msgs = [
     {"messageId": str(i), "text": f"m{i}", "publishedAt": fresh_iso, "url": "", "links": []}
@@ -1361,7 +1311,7 @@ res9 = _asyncio.run(ba.collect_with_scroll(
 check("messages limit trims to 10", len(res9), 10)
 check("messages limit keeps newest", res9[-1]["messageId"], "49")
 
-print("\n[browser_agent.collect_with_scroll heal] все проверки пройдены")
+print("\n[browser_agent.collect_with_scroll] все проверки пройдены")
 
 
 # --- script_tab_ids_to_close (R2) ----------------------------------------- #
@@ -1477,28 +1427,22 @@ async def _fake_ready(mcp):
     return _ready_values.pop(0) if _ready_values else True
 
 
-async def _fake_session(mcp, tab_hint):
-    _session_calls.append(tab_hint)
+async def _fake_session(mcp):
+    _session_calls.append(True)
     return True
 
 
-async def _fake_collect(mcp, source_url, since_hours, extract_js=None, heal_callback=None):
-    return []
-
-
-async def _fake_ai_js(mcp, source_url, label):
+async def _fake_collect(mcp, source_url, since_hours):
     return []
 
 
 _orig_ready = collect_mod.ba.wait_for_channel_ready
 _orig_session = collect_mod.ba.telegram_session_active
 _orig_collect_scroll = collect_mod.ba.collect_with_scroll
-_orig_ai_js = collect_mod._extract_via_ai_js
 try:
     collect_mod.ba.wait_for_channel_ready = _fake_ready
     collect_mod.ba.telegram_session_active = _fake_session
     collect_mod.ba.collect_with_scroll = _fake_collect
-    collect_mod._extract_via_ai_js = _fake_ai_js
     collect_mod.STATS["per_source"] = {}
     _session_calls.clear()
     _ready_values[:] = [True, True, False]
@@ -1516,7 +1460,6 @@ finally:
     collect_mod.ba.wait_for_channel_ready = _orig_ready
     collect_mod.ba.telegram_session_active = _orig_session
     collect_mod.ba.collect_with_scroll = _orig_collect_scroll
-    collect_mod._extract_via_ai_js = _orig_ai_js
 
 
 def _run_worker_queue_test():
@@ -1657,7 +1600,9 @@ def _fake_process_messages(source, messages):
     }
 
 _orig_process = server_mod.process_messages
+_orig_server_token = server_mod.SERVER_AUTH_TOKEN
 server_mod.process_messages = _fake_process_messages
+server_mod.SERVER_AUTH_TOKEN = "test-server-token"
 try:
     with server_mod.app.test_client() as client:
         payload = {
@@ -1668,11 +1613,23 @@ try:
                 for i in range(20)
             ],
         }
-        resp = client.post("/import-telegram", json=payload)
+        unauthorized = client.post("/import-telegram", json=payload)
+        check("endpoint rejects missing token", unauthorized.status_code, 401)
+        resp = client.post(
+            "/import-telegram",
+            json=payload,
+            headers={"Authorization": "Bearer test-server-token"},
+        )
         check("endpoint status 200", resp.status_code, 200)
         check("endpoint passes all messages", _captured_msg_count[-1], 20)
+        check(
+            "endpoint request limit configured",
+            server_mod.app.config["MAX_CONTENT_LENGTH"],
+            2 * 1024 * 1024,
+        )
 finally:
     server_mod.process_messages = _orig_process
+    server_mod.SERVER_AUTH_TOKEN = _orig_server_token
 
 print("\n[server] import-telegram message count OK")
 

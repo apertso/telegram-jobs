@@ -48,6 +48,7 @@ WORK_MODE_MAP = {
 
 # Хосты Telegram — не считаются «прямой» ссылкой на вакансию.
 TELEGRAM_HOSTS = ("t.me", "telegram.me", "web.telegram.org")
+CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
 
 # --------------------------------------------------------------------------- #
@@ -58,6 +59,14 @@ def _clean(value) -> str:
     if value is None:
         return ""
     return re.sub(r"\s+", " ", str(value).strip())
+
+
+def _csv_safe(value) -> str:
+    """Neutralize spreadsheet formulas in fields derived from untrusted posts."""
+    text = _clean(value)
+    if text.startswith(CSV_FORMULA_PREFIXES):
+        return "'" + text
+    return text
 
 
 def normalize_hyphens(value) -> str:
@@ -241,6 +250,10 @@ def normalize_url(url: str) -> str:
         return url
     if parts.scheme not in ("http", "https"):
         return url
+    if parts.username is not None or parts.password is not None:
+        return ""
+    if any(char in url for char in ("\r", "\n", "\t")):
+        return ""
 
     # Фильтруем query-параметры (thread здесь не бывает — он в фрагменте).
     kept = []
@@ -296,6 +309,8 @@ def is_direct_link(url: str) -> bool:
         return False
     if parts.scheme not in ("http", "https"):
         return False
+    if parts.username is not None or parts.password is not None:
+        return False
     host = parts.netloc.lower()
     if any(host == h or host.endswith("." + h) for h in TELEGRAM_HOSTS):
         return False
@@ -339,10 +354,10 @@ def normalize_job(job: dict) -> dict:
         job.get("workMode") or job.get("WorkMode") or "",
     )
     return {
-        "Title": _clean(job.get("title") or job.get("Title") or ""),
-        "Company": _clean(job.get("company") or job.get("Company") or ""),
-        "Location": loc,
-        "WorkMode": wm,
+        "Title": _csv_safe(job.get("title") or job.get("Title") or ""),
+        "Company": _csv_safe(job.get("company") or job.get("Company") or ""),
+        "Location": _csv_safe(loc),
+        "WorkMode": _csv_safe(wm),
         "URL": normalize_url(job.get("url") or job.get("URL") or ""),
     }
 
@@ -548,7 +563,7 @@ def _write_rows(path: str, rows: list[dict]) -> None:
             writer = csv.DictWriter(f, fieldnames=CSV_HEADER, quoting=csv.QUOTE_MINIMAL)
             writer.writeheader()
             for r in rows:
-                writer.writerow({k: r.get(k, "") for k in CSV_HEADER})
+                writer.writerow({k: _csv_safe(r.get(k, "")) for k in CSV_HEADER})
         os.replace(tmp_name, path)
     except Exception:
         try:

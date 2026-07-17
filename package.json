@@ -1,4 +1,9 @@
 {
+  "name": "telegram-jobs",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@playwright/mcp": "^0.0.78"
   }

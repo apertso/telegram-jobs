@@ -3,7 +3,7 @@ rem ===========================================================================
 rem Запуск сбора вакансий из Telegram Web через Playwright MCP (Extension).
 rem Требования:
 rem  - Python 3.11+
-rem  - Node.js 18+ и npx
+rem  - Node.js 20+ и npm
 rem  - Google Chrome запущен, в нём установлено Playwright Extension,
 rem    в .env заданы OPENROUTER_API_KEY и PLAYWRIGHT_MCP_EXTENSION_TOKEN.
 rem  - Chrome не закрывается скриптом; пользовательские вкладки не трогаются.
@@ -32,23 +32,22 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-node -e "const v=process.versions.node.split('.').map(Number); if(v[0]<18){process.exit(1)}" 2>nul
+node -e "const v=process.versions.node.split('.').map(Number); if(v[0]<20){process.exit(1)}" 2>nul
 if errorlevel 1 (
-  echo ОШИБКА: Требуется Node.js 18 или новее.
+  echo ОШИБКА: Требуется Node.js 20 или новее.
   pause
   exit /b 1
 )
 
-rem --- Проверка npx ---
-where npx >nul 2>nul
-if errorlevel 1 (
-  echo ОШИБКА: npx не найден в PATH.
+rem --- Проверка установленного Playwright MCP ---
+if not exist "node_modules\@playwright\mcp\cli.js" (
+  echo ОШИБКА: зависимости не установлены. Выполните npm ci.
   pause
   exit /b 1
 )
 
 rem --- Проверка обязательных файлов ---
-for %%f in (collect.py server.py browser_agent.py lib.py prompt.md channels.json playwright-mcp.json) do (
+for %%f in (collect.py server.py browser_agent.py lib.py channels.json playwright-mcp.json) do (
   if not exist "%%f" (
     echo ОШИБКА: отсутствует обязательный файл %%f
     pause

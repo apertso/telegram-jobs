@@ -1,14 +1,43 @@
+# Private configuration
 .env
-*.log
-*.lock
-__pycache__
-node_modules
-.opencode
-latest
-telegram.csv
-project_code.txt
-.playwright-mcp/
-collect.log
-telegram_extract_cache.js
-diagnostics/
+.env.*
+!.env.example
 channels.json
+
+# Runtime data
+*.csv
+*.jsonl
+*.log
+telegram.csv.lock
+diagnostics/
+telegram_extract_cache.js
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Node and browser state
+node_modules/
+.playwright-mcp/
+
+# Editors, operating systems, and temporary output
+.DS_Store
+.idea/
+.vscode/
+*.bak
+*.dump
+*.tmp
+*.key
+*.p12
+*.pem
+.opencode/
+project_code.txt

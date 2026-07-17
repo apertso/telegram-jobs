@@ -5,7 +5,6 @@
 """
 
 import asyncio
-import os
 import sys
 from pathlib import Path
 
@@ -42,10 +41,10 @@ async def _reset(mcp):
     await asyncio.sleep(5)
 
 
-async def _hash_and_msg(mcp):
+async def _hash_and_message_fingerprint(mcp):
     h = await _eval(mcp, "() => location.hash")
-    m = await _eval(mcp, "() => { const el = document.querySelector('[data-mid] .text') || document.querySelector('[data-mid]'); return el ? el.innerText.slice(0,80) : 'none'; }")
-    return h, m
+    fingerprint = await _eval(mcp, "() => { const el = document.querySelector('[data-mid] .text') || document.querySelector('[data-mid]'); const value = el ? (el.innerText || '') : ''; let hash = 2166136261; for (let i = 0; i < value.length; i++) { hash ^= value.charCodeAt(i); hash = Math.imul(hash, 16777619); } return (hash >>> 0).toString(16); }")
+    return h, fingerprint
 
 
 def check(name, cond, got="", expected=""):
@@ -58,66 +57,65 @@ def check(name, cond, got="", expected=""):
 
 
 async def run_tests():
-    pkg = os.getenv("PLAYWRIGHT_MCP_PACKAGE") or "@playwright/mcp"
-    m = ba.MCPSession(pkg, HERE / "playwright-mcp.json")
+    m = ba.MCPSession(HERE / "playwright-mcp.json")
     await m.start()
 
     results = []
 
     # Базовое состояние: канал 1.
     await _reset(m)
-    h1, msg1 = await _hash_and_msg(m)
+    h1, fingerprint1 = await _hash_and_message_fingerprint(m)
     results.append(check("база: hash = #@evacuatejobs", h1 == "#@evacuatejobs", h1, "#@evacuatejobs"))
 
     # --- 1. browser_navigate на тот же домен с другим hash (2-й раз) НЕ работает ---
     await m.call("browser_navigate", {"url": URL_2}, timeout=15)
     await asyncio.sleep(3)
-    h, msg = await _hash_and_msg(m)
+    h, fingerprint = await _hash_and_message_fingerprint(m)
     results.append(check("browser_navigate 2-й раз: НЕ работает (FAIL expected)",
-                         h == "#@evacuatejobs" and msg == msg1))
+                         h == "#@evacuatejobs" and fingerprint == fingerprint1))
 
     # --- 2. location.hash НЕ открывает канал ---
     await _reset(m)
     await _eval(m, "() => { location.hash = '#@g_jobbot'; return location.hash; }")
     await asyncio.sleep(3)
-    h, msg = await _hash_and_msg(m)
+    h, fingerprint = await _hash_and_message_fingerprint(m)
     results.append(check("location.hash: канал НЕ меняется (FAIL expected)",
-                         msg == msg1, msg[:80], "!= " + msg1[:80]))
+                         fingerprint == fingerprint1, fingerprint, "different fingerprint"))
 
     # --- 3. location.replace НЕ открывает канал ---
     await _reset(m)
     await _eval(m, "() => { location.replace('https://web.telegram.org/k/#@g_jobbot'); return 'ok'; }")
     await asyncio.sleep(3)
-    h, msg = await _hash_and_msg(m)
+    h, fingerprint = await _hash_and_message_fingerprint(m)
     results.append(check("location.replace: канал НЕ меняется (FAIL expected)",
-                         msg == msg1, msg[:80], "!= " + msg1[:80]))
+                         fingerprint == fingerprint1, fingerprint, "different fingerprint"))
 
     # --- 4. history.pushState + popstate НЕ работает ---
     await _reset(m)
     await _eval(m, "() => { history.pushState(null, '', '#@g_jobbot'); window.dispatchEvent(new PopStateEvent('popstate')); return location.hash; }")
     await asyncio.sleep(3)
-    h, msg = await _hash_and_msg(m)
+    h, fingerprint = await _hash_and_message_fingerprint(m)
     results.append(check("pushState + popstate: канал НЕ меняется (FAIL expected)",
-                         msg == msg1, msg[:80], "!= " + msg1[:80]))
+                         fingerprint == fingerprint1, fingerprint, "different fingerprint"))
 
     # --- 5. hashchange dispatch НЕ работает ---
     await _reset(m)
     await _eval(m, "() => { location.hash = '#@g_jobbot'; window.dispatchEvent(new HashChangeEvent('hashchange')); return location.hash; }")
     await asyncio.sleep(3)
-    h, msg = await _hash_and_msg(m)
+    h, fingerprint = await _hash_and_message_fingerprint(m)
     results.append(check("hashchange dispatch: канал НЕ меняется (FAIL expected)",
-                         msg == msg1, msg[:80], "!= " + msg1[:80]))
+                         fingerprint == fingerprint1, fingerprint, "different fingerprint"))
 
     # --- 6. about:blank → полный URL РАБОТАЕТ ---
     await _reset(m)
     await m.call("browser_navigate", {"url": "about:blank"}, timeout=10)
     await m.call("browser_navigate", {"url": URL_2}, timeout=15)
     await asyncio.sleep(5)
-    h, msg = await _hash_and_msg(m)
+    h, fingerprint = await _hash_and_message_fingerprint(m)
     results.append(check("about:blank → URL: hash = #@g_jobbot",
                          h == "#@g_jobbot", h, "#@g_jobbot"))
     results.append(check("about:blank → URL: контент меняется",
-                         msg != msg1, msg[:80], "!= " + msg1[:80]))
+                         fingerprint != fingerprint1, fingerprint, "different fingerprint"))
 
     await m.stop()
 

@@ -1,10 +1,7 @@
-"""Браузерный агент: OpenRouter tool-calling цикл поверх Playwright MCP.
+"""Deterministic Telegram Web collection through Playwright MCP.
 
-Координатор (collect.py) запускает MCP-процесс (Playwright MCP через Extension)
-и создаёт MCP-сессию. Для каждого источника этот модуль запускает отдельный
-tool-calling цикл: модель выбирает разрешённые MCP tools, координатор
-выполняет их, результат возвращается модели. Итог — строго разобранный JSON
-с сообщениями текущего источника.
+The collector uses a small MCP tool allowlist and a fixed, read-only extraction
+function. Model-generated browser code is never executed.
 
 Playwright MCP подключается к текущему профилю Chrome ЧЕРЕЗ расширение,
 новый браузер не запускается, remote debugging не используется, профиль не
@@ -26,27 +23,19 @@ from urllib.parse import urlsplit
 import lib
 
 HERE = Path(__file__).resolve().parent
+MCP_CLI = HERE / "node_modules" / "@playwright" / "mcp" / "cli.js"
 
 # Обязательный allowlist MCP tools. Любой tool вне списка запрещён.
 ALLOWED_MCP_TOOLS = {
     "browser_tabs",
     "browser_navigate",
     "browser_snapshot",
-    "browser_find",
-    "browser_wait_for",
-    "browser_click",
-    "browser_press_key",
     "browser_evaluate",
-    "browser_highlight",
-    "browser_hide_highlight",
 }
 
 # Явно запрещённые tools.
 FORBIDDEN_MCP_TOOLS = {"browser_run_code_unsafe"}
 
-# Параметр прокрутки / ожидания по умолчанию.
-HIGHLIGHT_BEFORE_CLICK = (os.getenv("HIGHLIGHT_BEFORE_CLICK", "false").lower()
-                          not in ("0", "false", "no", "off"))
 MAX_MESSAGE_TEXT = 8000
 # Опциональный лимит (0 = без ограничения). Не применяется до фильтра времени на server.
 MAX_MESSAGES = int(os.getenv("TELEGRAM_MESSAGES_LIMIT", "0"))
@@ -109,28 +98,32 @@ EXTRACT_MESSAGES_JS = """() => {
 }"""
 
 
-# --------------------------------------------------------------------------- #
-# Безопасное логирование
-# --------------------------------------------------------------------------- #
-def _safe_args(args: dict) -> dict:
-    """Очищает tool arguments перед логированием: оставляем только простые
-    скалярные значения, обрезаем длинные строки. Без чувствительных данных."""
-    if not isinstance(args, dict):
-        return {}
-    out = {}
-    for k, v in args.items():
-        if isinstance(v, (str, int, float, bool)):
-            val = str(v)
-            if len(val) > 200:
-                val = val[:200] + "…"
-            out[k] = val
-        else:
-            out[k] = f"<{type(v).__name__}>"
-    return out
-
-
 def log(*parts) -> None:
     print("[browser_agent]", *parts, file=sys.stderr)
+
+
+def _mcp_subprocess_env() -> dict[str, str]:
+    """Build the minimal environment required by Node.js and the MCP extension."""
+    keys = {
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+    }
+    env = {key: value for key in keys if (value := os.getenv(key))}
+    env.setdefault("PATH", os.defpath)
+    env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] = (
+        os.getenv("PLAYWRIGHT_MCP_EXTENSION_TOKEN") or ""
+    )
+    return env
 
 
 # --------------------------------------------------------------------------- #
@@ -143,13 +136,12 @@ class MCPError(Exception):
 class MCPSession:
     """Обёртка над Playwright MCP stdio-сессией.
 
-    Запускает `npx @playwright/mcp --config playwright-mcp.json` как дочерний
+    Запускает локальный `@playwright/mcp` из node_modules как дочерний
     процесс БЕЗ shell, передаёт PLAYWRIGHT_MCP_EXTENSION_TOKEN только в его
     окружение. Выполняет initialization и получает список tools.
     """
 
-    def __init__(self, package: str, config_path: Path):
-        self.package = package
+    def __init__(self, config_path: Path):
         self.config_path = config_path
         self.tools: dict[str, dict] = {}
         self._session = None
@@ -162,11 +154,8 @@ class MCPSession:
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.stdio import stdio_client
 
-        token = os.getenv("PLAYWRIGHT_MCP_EXTENSION_TOKEN") or ""
-        env = os.environ.copy()
-        env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] = token
-        env.pop("PLAYWRIGHT_MCP_HOST", None)
-        # НЕ задаём PWTEST_EXTENSION_USER_DATA_DIR: при его отсутствии MCP
+        env = _mcp_subprocess_env()
+        # Do not set PWTEST_EXTENSION_USER_DATA_DIR: when absent MCP
         # использует defaultUserDataDirForChannel("chrome") для проверки
         # установки расширения, но НЕ передаёт --user-data-dir в spawn.
         # В результате connect.html откроется в УЖЕ запущенном экземпляре Chrome
@@ -174,12 +163,17 @@ class MCPSession:
         # к реальным вкладкам с активной сессией Telegram Web.
         env.pop("PWTEST_EXTENSION_USER_DATA_DIR", None)
 
-        if not _validate_package(self.package):
-            raise MCPError(f"Недопустимый PLAYWRIGHT_MCP_PACKAGE: {self.package!r}")
+        if not MCP_CLI.is_file():
+            raise MCPError("@playwright/mcp не установлен; выполните npm ci")
 
         params = StdioServerParameters(
-            command="npx",
-            args=["-y", self.package, "--config", str(self.config_path), "--extension"],
+            command="node",
+            args=[
+                str(MCP_CLI),
+                "--config",
+                str(self.config_path),
+                "--extension",
+            ],
             env=env,
             # shell=False — не используем оболочку.
         )
@@ -206,20 +200,10 @@ class MCPSession:
             names.append(t.name)
         log("MCP tools:", ", ".join(names))
 
-    async def verify_tools(self, require_highlight: bool = True) -> None:
-        # Обязательные базовые tools (всегда необходимы).
-        core = ALLOWED_MCP_TOOLS - {"browser_highlight", "browser_hide_highlight"}
-        missing = sorted(core - set(self.tools))
+    async def verify_tools(self) -> None:
+        missing = sorted(ALLOWED_MCP_TOOLS - set(self.tools))
         if missing:
             raise MCPError(f"Отсутствуют обязательные MCP tools: {missing}")
-        # Highlight tools обязательны только при HIGHLIGHT_BEFORE_CLICK=true.
-        if require_highlight:
-            hl = {"browser_highlight", "browser_hide_highlight"} & set(self.tools)
-            if len(hl) < 2:
-                raise MCPError(
-                    "HIGHLIGHT_BEFORE_CLICK=true, но MCP не предоставляет "
-                    "browser_highlight/browser_hide_highlight."
-                )
         # FORBIDDEN_MCP_TOOLS (например browser_run_code_unsafe) НЕ должны
         # быть доступны агенту: они исключены из tool_defs и блокируются в call().
         # Сам факт их наличия в сервере не прерывает запуск — мы просто не вызываем.
@@ -236,7 +220,7 @@ class MCPSession:
             raise MCPError(f"Tool {name} не входит в allowlist")
         if name not in self.tools:
             raise MCPError(f"Tool {name} недоступен в MCP")
-        log("MCP tool:", name, _safe_args(arguments))
+        log("MCP tool:", name)
         result = await asyncio.wait_for(
             self._session.call_tool(name, arguments or {}), timeout=timeout
         )
@@ -271,15 +255,6 @@ def _mcp_result_to_text(result) -> str:
     if not parts:
         parts.append(str(result))
     return "\n".join(parts)
-
-
-def _validate_package(package: str) -> bool:
-    """Разрешаем только известный scoped-пакет @playwright/mcp (без shell-метасимволов)."""
-    if not package:
-        return False
-    if " " in package or ";" in package or "&" in package or "|" in package:
-        return False
-    return bool(re.fullmatch(r"@playwright/mcp(@[0-9][\w.\-]*)?", package))
 
 
 # --------------------------------------------------------------------------- #
@@ -362,7 +337,7 @@ def _clean_messages(data: dict, source_url: str) -> list[dict]:
         links = m.get("links") or []
         if not isinstance(links, list):
             links = []
-        links = _clean_links(links, text)
+        links = _clean_links(links)
         url = str(m.get("url") or "").strip()
         if not url:
             url = lib.message_permalink(source_url, mid)
@@ -381,7 +356,7 @@ def _clean_messages(data: dict, source_url: str) -> list[dict]:
     return out
 
 
-def _clean_links(links: list, text: str) -> list[str]:
+def _clean_links(links: list) -> list[str]:
     """Из links удаляет дубликаты, картинки/emoji, служебные Telegram-ссылки
     и ссылки, не относящиеся к сообщению."""
     TELEGRAM = ("t.me", "telegram.me", "web.telegram.org")
@@ -557,23 +532,6 @@ def _accumulated_oldest_ts(accumulated: dict[str, dict]) -> float | None:
     return best
 
 
-def _has_timestamps(messages: list[dict]) -> bool:
-    """Проверяет, есть ли валидные метки publishedAt хотя бы в половине сообщений.
-
-    Отвергает нереалистичные метки (epoch 0, дальнее будущее).
-    """
-    if not messages:
-        return False
-    now = time.time()
-    ten_years_ago = now - 10 * 365 * 24 * 3600
-    valid = sum(
-        1 for m in messages
-        if (ts := _parse_iso_ts(m.get("publishedAt", ""))) is not None
-        and ten_years_ago < ts <= now + 3600
-    )
-    return valid > 0 and valid >= (len(messages) + 1) // 2
-
-
 async def collect_with_scroll(
     mcp: "MCPSession",
     source_url: str,
@@ -581,8 +539,6 @@ async def collect_with_scroll(
     max_iter: int = SCROLL_MAX_ITER,
     wait_ms: int = SCROLL_WAIT_MS,
     tail_tolerance_s: int = SCROLL_TAIL_TOLERANCE_S,
-    extract_js: str | None = None,
-    heal_callback=None,
     max_messages: int | None = None,
 ) -> list[dict]:
     """Сбор сообщений из Telegram Web с прокруткой в обе стороны (R4).
@@ -597,21 +553,16 @@ async def collect_with_scroll(
          (now - since_hours*3600) или пока не перестанут появляться новые.
       4. Сливает все уникальные сообщения, сортирует старые→новые.
 
-    Если после начального извлечения сообщения есть, но метки времени
-    отсутствуют, вызывается heal_callback (если передан) для генерации
-    нового JS с актуальными селекторами. Этот JS используется во всех
-    последующих извлечениях.
-
     Возвращает список сообщений; фильтр по времени применяет server.py.
     """
-    js = extract_js or EXTRACT_MESSAGES_JS
-
     cutoff = time.time() - since_hours * 3600
     now = time.time()
     accumulated: dict[str, dict] = {}
 
     async def _extract() -> list[dict]:
-        raw = await mcp.call("browser_evaluate", {"function": js}, timeout=10)
+        raw = await mcp.call(
+            "browser_evaluate", {"function": EXTRACT_MESSAGES_JS}, timeout=10
+        )
         return _parse_evaluate_result(raw, source_url)
 
     async def _scroll(direction: str) -> None:
@@ -630,18 +581,6 @@ async def collect_with_scroll(
     batch = await _extract()
     _merge_by_id(accumulated, batch)
     log(f"scroll initial: {_batch_summary(batch)}, total={len(accumulated)}")
-
-    # --- Auto-healing: если метки времени отсутствуют (в т.ч. устаревший кэш) ---
-    if batch and not _has_timestamps(batch) and heal_callback is not None:
-        log("timestamps missing after initial extract, invoking heal_callback")
-        healed_js = await heal_callback(mcp)
-        if healed_js:
-            js = healed_js
-            log("heal_callback returned new JS, re-extracting")
-            batch = await _extract()
-            accumulated.clear()
-            _merge_by_id(accumulated, batch)
-            log(f"scroll after heal: {_batch_summary(batch)}, total={len(accumulated)}")
 
     older_edge, newer_edge = _detect_scroll_direction(batch) if batch else ("top", "bottom")
     at_bottom = await _at_bottom() if batch else None
@@ -803,7 +742,7 @@ async def wait_for_channel_ready(
 # --------------------------------------------------------------------------- #
 # Проверка активной Telegram-сессии через snapshot
 # --------------------------------------------------------------------------- #
-async def telegram_session_active(mcp: MCPSession, tab_hint: str) -> bool:
+async def telegram_session_active(mcp: MCPSession) -> bool:
     """Через browser_snapshot определяет наличие активной Telegram-сессии.
     При QR/форме входа/отсутствии интерфейса — False."""
     try:
@@ -830,7 +769,7 @@ async def telegram_session_active(mcp: MCPSession, tab_hint: str) -> bool:
     if matched:
         log("session: active, markers:", matched)
         return True
-    log("session: no markers, snap len:", len(snap), "preview:", snap[:300])
+    log("session: no markers, snap len:", len(snap))
     return False
 
 

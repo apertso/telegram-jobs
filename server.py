@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import atexit
 import concurrent.futures
+import hmac
 import json
 import os
 import re
@@ -44,6 +45,7 @@ OPENROUTER_API_KEY = (os.getenv("OPENROUTER_API_KEY") or "").strip()
 OPENROUTER_MODEL = (os.getenv("OPENROUTER_MODEL") or "tencent/hy3:free").strip()
 PORT = int(os.getenv("PORT", "3000"))
 SINCE_HOURS = int(os.getenv("TELEGRAM_SINCE_HOURS", "24"))
+SERVER_AUTH_TOKEN = (os.getenv("TELEGRAM_JOBS_SERVER_TOKEN") or "").strip()
 
 # Максимальный размер текста одного сообщения (защита от DoS/ошибок).
 MAX_MESSAGE_TEXT = 8000
@@ -127,10 +129,19 @@ SHORT_STACK_RE = re.compile(
     r"(?<![\w.])(?:JS|TS)(?![\w.])"
 )
 
-# OpenRouter REST endpoint (OpenAI-совместимый).
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
+
+
+@app.before_request
+def require_local_auth():
+    if not SERVER_AUTH_TOKEN:
+        return jsonify({"error": "server authentication is not configured"}), 503
+    supplied = request.headers.get("Authorization", "")
+    expected = f"Bearer {SERVER_AUTH_TOKEN}"
+    if not hmac.compare_digest(supplied, expected):
+        return jsonify({"error": "unauthorized"}), 401
+    return None
 
 
 def _cleanup_lock() -> None:
@@ -525,6 +536,7 @@ def _call_openrouter(model: str, user_prompt: str):
                 messages=messages,
                 temperature=0,
                 response_format={"type": "json_object"},
+                timeout=25,
             )
             return resp.choices[0].message.content
         except Exception as e:  # noqa: BLE001
@@ -965,11 +977,6 @@ def process_messages(source: str, messages) -> dict:
 # --------------------------------------------------------------------------- #
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "csv": CSV_PATH})
-
-
-@app.route("/", methods=["GET"])
-def index():
     return jsonify({"status": "ok"})
 
 
@@ -1026,6 +1033,8 @@ def import_telegram():
 
 
 def main():
+    if not SERVER_AUTH_TOKEN:
+        raise SystemExit("TELEGRAM_JOBS_SERVER_TOKEN is required")
     print(f"[server] Запуск обработчика на порту {PORT}")
     print(f"[server] CSV: {CSV_PATH}")
     print(f"[server] Фильтр по времени: только сообщения за последние {SINCE_HOURS}ч")
