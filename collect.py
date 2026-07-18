@@ -56,6 +56,8 @@ SERVER_FILE = HERE / "server.py"
 MCP_CONFIG = HERE / "playwright-mcp.json"
 ENDPOINT = f"http://127.0.0.1:{PORT}/import-telegram"
 OPENROUTER_WORKERS = 2
+SUBMIT_HTTP_TIMEOUT = 90
+SUBMIT_TASK_TIMEOUT = 100
 SERVER_AUTH_TOKEN = ""
 
 STATS: dict = {"per_source": {}}
@@ -178,7 +180,11 @@ def stop_server(proc) -> None:
         pass
 
 
-def submit_messages(source: str, messages: list[dict], timeout: int = 90) -> dict:
+def submit_messages(
+    source: str,
+    messages: list[dict],
+    timeout: int = SUBMIT_HTTP_TIMEOUT,
+) -> dict:
     if not SERVER_AUTH_TOKEN:
         raise RuntimeError("Локальный обработчик не аутентифицирован")
     payload = json.dumps({"source": source, "messages": messages}).encode()
@@ -210,8 +216,13 @@ async def _submit_collected_messages(source_url: str, messages: list[dict], stat
         t0 = time.monotonic()
         print(f"[{label}] Извлечение вакансий: {scraped_count} сообщений → обработчик...")
         resp = await asyncio.wait_for(
-            asyncio.to_thread(submit_messages, source_url, messages, 90),
-            timeout=90,
+            asyncio.to_thread(
+                submit_messages,
+                source_url,
+                messages,
+                SUBMIT_HTTP_TIMEOUT,
+            ),
+            timeout=SUBMIT_TASK_TIMEOUT,
         )
         print(f"[{label}] Извлечение завершено за {time.monotonic() - t0:.1f}s")
         stats.update({

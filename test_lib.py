@@ -265,6 +265,11 @@ check(
     "querySelectorAll('div.bubble[data-mid]')" in ba.EXTRACT_MESSAGES_JS,
     True,
 )
+check(
+    "extractor skips non-positive service ids",
+    "Number(mid) <= 0" in ba.EXTRACT_MESSAGES_JS,
+    True,
+)
 
 _duplicate_dom_messages = ba._clean_messages(
     {
@@ -286,6 +291,14 @@ check(
     "clean duplicate DOM message fills timestamp",
     _duplicate_dom_messages[0]["publishedAt"],
     "2026-07-18T10:00:00Z",
+)
+check(
+    "clean messages skips negative service id",
+    ba._clean_messages(
+        {"messages": [{"messageId": "-1", "text": "service", "publishedAt": "1970-01-01T00:00:00Z"}]},
+        "https://web.telegram.org/k/#@test",
+    ),
+    [],
 )
 
 
@@ -865,6 +878,28 @@ finally:
 
 print("\n[server OpenRouter timeout] проверка пройдена")
 
+# Встроенные retry OpenAI SDK должны быть выключены: повторные попытки уже
+# ограниченно выполняет server._call_openrouter.
+import openai as _openai
+_orig_openai_ctor = _openai.OpenAI
+_orig_server_client = server_mod._client
+_client_kwargs = {}
+
+
+class _FakeOpenAIClient:
+    def __init__(self, **kwargs):
+        _client_kwargs.update(kwargs)
+
+
+try:
+    _openai.OpenAI = _FakeOpenAIClient
+    server_mod._client = None
+    server_mod._get_client()
+    check("OpenAI SDK retries disabled", _client_kwargs.get("max_retries"), 0)
+finally:
+    _openai.OpenAI = _orig_openai_ctor
+    server_mod._client = _orig_server_client
+
 
 # --- server chunking + strict validation ---------------------------------- #
 chunk_messages = [
@@ -1422,6 +1457,12 @@ print("\n[collect.async submit] все проверки пройдены")
 
 # --- collect._source_outcome ------------------------------------------------ #
 import collect as collect_mod
+
+check(
+    "submit task timeout exceeds HTTP timeout",
+    collect_mod.SUBMIT_TASK_TIMEOUT > collect_mod.SUBMIT_HTTP_TIMEOUT,
+    True,
+)
 
 check("outcome success", collect_mod._source_outcome({"errors": [], "skipped": ""}), "success")
 check("outcome skipped", collect_mod._source_outcome({"skipped": "all old"}), "skipped")

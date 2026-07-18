@@ -58,6 +58,7 @@ EXTRACT_MESSAGES_JS = r"""() => {
       ? new Date(numeric > 1e12 ? numeric : numeric * 1000)
       : new Date(raw);
     if (isNaN(d.getTime())) return '';
+    if (d.getTime() < Date.UTC(2013, 0, 1) || d.getTime() > Date.now() + 86400000) return '';
     return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
   }
   function normalizeMid(mid) {
@@ -90,7 +91,7 @@ EXTRACT_MESSAGES_JS = r"""() => {
   for (const it of nodes) {
     if (it.classList.contains('service') || it.classList.contains('bubbles-date-group')) continue;
     const mid = it.getAttribute('data-mid');
-    if (!mid) continue;
+    if (!mid || !/^\d+$/.test(mid) || Number(mid) <= 0) continue;
     const publishedAt = readTimestamp(it);
     const textEl = it.querySelector('.text') || it.querySelector('.bubble-content') || it;
     const text = (textEl.innerText || textEl.textContent || '').trim();
@@ -342,6 +343,8 @@ def _clean_messages(data: dict, source_url: str) -> list[dict]:
         if not isinstance(m, dict):
             continue
         mid = lib.normalize_message_id(str(m.get("messageId") or "").strip())
+        if mid.startswith("-"):
+            continue
         text = (m.get("text") or "").strip()
         if not text:
             continue

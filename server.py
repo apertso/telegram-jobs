@@ -283,6 +283,7 @@ def _get_client():
         _client = OpenAI(
             api_key=OPENROUTER_API_KEY or "missing",
             base_url="https://openrouter.ai/api/v1",
+            max_retries=0,
             default_headers={
                 "HTTP-Referer": "https://github.com/telegram-jobs-collector",
                 "X-Title": "Telegram Jobs Collector",
