@@ -49,13 +49,16 @@ NAV_READY_TIMEOUT_S = float(os.getenv("NAV_READY_TIMEOUT_S", "5"))
 
 # Read-only JS для извлечения сообщений из Telegram Web (web.telegram.org/k).
 # НЕ изменяет DOM, storage, cookies или сеть. Только чтение видимых сообщений.
-EXTRACT_MESSAGES_JS = """() => {
-  const pad = n => String(n).padStart(2, '0');
+EXTRACT_MESSAGES_JS = r"""() => {
   function toIso(ts) {
-    const d = new Date(parseInt(ts, 10) * 1000);
+    const raw = String(ts || '').trim();
+    if (!raw) return '';
+    const numeric = Number(raw);
+    const d = Number.isFinite(numeric)
+      ? new Date(numeric > 1e12 ? numeric : numeric * 1000)
+      : new Date(raw);
     if (isNaN(d.getTime())) return '';
-    return d.getUTCFullYear() + '-' + pad(d.getUTCMonth()+1) + '-' + pad(d.getUTCDate())
-      + 'T' + pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ':' + pad(d.getUTCSeconds()) + 'Z';
+    return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
   }
   function normalizeMid(mid) {
     const n = parseInt(mid, 10);
@@ -64,34 +67,43 @@ EXTRACT_MESSAGES_JS = """() => {
     return String(n);
   }
   function readTimestamp(el) {
-    const direct = el.getAttribute('data-timestamp');
-    if (direct) return direct;
-    const nested = el.querySelector('[data-timestamp]');
-    if (nested) return nested.getAttribute('data-timestamp') || '';
-    const timeEl = el.querySelector('.time, .time-inner, [data-time]');
-    if (timeEl) return timeEl.getAttribute('data-time') || timeEl.getAttribute('datetime') || '';
+    const candidates = [
+      el,
+      ...el.querySelectorAll(
+        '[data-timestamp], [data-time], time[datetime], '
+        + '.time[datetime], .time-inner[datetime], .time[title], '
+        + '.time-inner[title], .time[aria-label], .time-inner[aria-label]'
+      )
+    ];
+    for (const candidate of candidates) {
+      for (const attr of ['data-timestamp', 'data-time', 'datetime', 'title', 'aria-label']) {
+        const iso = toIso(candidate.getAttribute(attr));
+        if (iso) return iso;
+      }
+    }
     return '';
   }
-  // Ищем элементы с data-mid (маркер сообщения в Telegram Web K).
-  const nodes = Array.from(document.querySelectorAll('[data-mid]'));
+  // Только верхнеуровневые карточки сообщений. Вложенные [data-mid] встречаются
+  // в цитатах и превью и не имеют собственной метки времени.
+  const nodes = Array.from(document.querySelectorAll('div.bubble[data-mid]'));
   let items = [];
   for (const it of nodes) {
     if (it.classList.contains('service') || it.classList.contains('bubbles-date-group')) continue;
     const mid = it.getAttribute('data-mid');
     if (!mid) continue;
-    const ts = readTimestamp(it);
+    const publishedAt = readTimestamp(it);
     const textEl = it.querySelector('.text') || it.querySelector('.bubble-content') || it;
     const text = (textEl.innerText || textEl.textContent || '').trim();
     if (!text || text.length < 2) continue;
     const links = Array.from(it.querySelectorAll('a'))
       .map(a => a.href)
       .filter(h => h && /^https?:/i.test(h));
-    items.push({ mid, ts, text, links });
+    items.push({ mid, publishedAt, text, links });
   }
   return JSON.stringify(items.map(m => ({
     messageId: normalizeMid(m.mid) || '',
     text: m.text,
-    publishedAt: toIso(m.ts),
+    publishedAt: m.publishedAt,
     url: '',
     links: m.links
   })));
@@ -324,7 +336,7 @@ def _clean_messages(data: dict, source_url: str) -> list[dict]:
     raw = data.get("messages")
     if not isinstance(raw, list):
         return []
-    seen = set()
+    positions: dict[str, int] = {}
     out = []
     for m in raw:
         if not isinstance(m, dict):
@@ -343,9 +355,12 @@ def _clean_messages(data: dict, source_url: str) -> list[dict]:
             url = lib.message_permalink(source_url, mid)
         pub = str(m.get("publishedAt") or "").strip()
         key = mid or text
-        if key in seen:
+        if key in positions:
+            existing = out[positions[key]]
+            if not existing["publishedAt"] and pub:
+                existing["publishedAt"] = pub
             continue
-        seen.add(key)
+        positions[key] = len(out)
         out.append({
             "messageId": mid,
             "text": text,
@@ -475,7 +490,7 @@ def _scroll_at_bottom_from_eval(raw: str) -> bool | None:
 
 
 def _merge_by_id(accumulated: dict[str, dict], batch: list[dict]) -> int:
-    """Сливает batch в accumulated (по messageId), возвращает кол-во новых."""
+    """Сливает batch по messageId и дополняет ранее отсутствующую дату."""
     new_count = 0
     for m in batch:
         mid = m.get("messageId") or ""
@@ -483,6 +498,8 @@ def _merge_by_id(accumulated: dict[str, dict], batch: list[dict]) -> int:
         if key not in accumulated:
             accumulated[key] = m
             new_count += 1
+        elif not accumulated[key].get("publishedAt") and m.get("publishedAt"):
+            accumulated[key]["publishedAt"] = m["publishedAt"]
     return new_count
 
 

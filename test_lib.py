@@ -260,6 +260,33 @@ check(
     {"extract_js", "heal_callback"}.isdisjoint(inspect.signature(ba.collect_with_scroll).parameters),
     True,
 )
+check(
+    "extractor selects Telegram message bubbles",
+    "querySelectorAll('div.bubble[data-mid]')" in ba.EXTRACT_MESSAGES_JS,
+    True,
+)
+
+_duplicate_dom_messages = ba._clean_messages(
+    {
+        "messages": [
+            {"messageId": "42", "text": "same post", "publishedAt": "", "url": "", "links": []},
+            {
+                "messageId": "42",
+                "text": "same post",
+                "publishedAt": "2026-07-18T10:00:00Z",
+                "url": "",
+                "links": [],
+            },
+        ]
+    },
+    "https://web.telegram.org/k/#@test",
+)
+check("clean duplicate DOM message count", len(_duplicate_dom_messages), 1)
+check(
+    "clean duplicate DOM message fills timestamp",
+    _duplicate_dom_messages[0]["publishedAt"],
+    "2026-07-18T10:00:00Z",
+)
 
 
 class _SnapshotMCP:
@@ -1113,6 +1140,8 @@ check("merge size", len(acc), 2)
 n2 = ba._merge_by_id(acc, [{"messageId": "a", "text": "x"}, {"messageId": "c", "text": "z"}])
 check("merge dedup count", n2, 1)
 check("merge size after dedup", len(acc), 3)
+ba._merge_by_id(acc, [{"messageId": "a", "text": "x", "publishedAt": fresh_iso}])
+check("merge duplicate fills timestamp", acc["a"]["publishedAt"], fresh_iso)
 
 # _scroll_js
 check("scroll top js has scrollTop=0", "scrollTop = 0" in ba._scroll_js("top"), True)
@@ -1300,6 +1329,23 @@ res5 = _asyncio.run(ba.collect_with_scroll(fake5, "https://web.telegram.org/k/#@
 # 1 initial + 3 phase1 + 1 phase2-init + 3 phase2 = max 8 messages, 6 scrolls
 check("scroll no-ts did not exhaust max_iter", fake5.scroll_count < 10, True)
 check("scroll no-ts bounded message count", len(res5) <= 10, True)
+
+# Сценарий 6: Telegram сначала отдаёт карточку до появления timestamp,
+# затем тот же messageId с уже заполненной датой.
+extracts6 = [
+    _msg_json([
+        {"messageId": "m1", "text": "same", "publishedAt": "", "url": "", "links": []},
+    ]),
+    _msg_json([
+        {"messageId": "m1", "text": "same", "publishedAt": fresh_iso, "url": "", "links": []},
+    ]),
+]
+res6 = _asyncio.run(ba.collect_with_scroll(
+    _FakeMCP(extracts6), "https://web.telegram.org/k/#@t", 24,
+    tail_tolerance_s=7200, wait_ms=0, max_iter=2,
+))
+check("scroll duplicate message count", len(res6), 1)
+check("scroll duplicate fills timestamp", res6[0]["publishedAt"], fresh_iso)
 
 # Сценарий 9: max_messages обрезает результат до N самых новых.
 _many_msgs = [
